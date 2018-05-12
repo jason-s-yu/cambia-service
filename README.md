@@ -33,3 +33,5 @@ A socket-based API for Cambia with a self-learning bot, written in Golang
 > **[`/database/`](./database)** - Database Files
 
 * [`database.go`](./database/database.go) - database entry file
+
+## [Router Documentation](./api/readme.md)
