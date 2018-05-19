@@ -2,6 +2,9 @@ package api
 
 import "net/http"
 
+type Deck struct {
+}
+
 // GetDecks returns a nested json structure of all the user decks in the game
 func GetDecks(writer http.ResponseWriter, request *http.Request) {
 
