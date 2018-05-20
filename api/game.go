@@ -10,7 +10,7 @@ type GameState struct {
 	Players []string `json:"players"`
 	Decks   []Deck   `json:"decks"`
 }
-
+	
 func newGameState() GameState {
 	gs := GameState{}
 	return gs

@@ -9,6 +9,8 @@ import (
 	"github.com/gorilla/websocket"
 	"log"
 	"fmt"
+	"encoding/json"
+	"github.com/satori/go.uuid"
 )
 
 func main() {
@@ -50,13 +52,37 @@ func main() {
 
 func serveEndpoints(router *mux.Router) {
 	router.HandleFunc("/", defaultPage)
-	router.HandleFunc("/ws", handleConnections)		// this defaults to a GET method - we will change this in the function handleConnections
+	router.HandleFunc("joingame", joinGame).Methods("POST")		// join a game -> redir to game
+	router.HandleFunc("/game", handleConnections)							// this defaults to a GET method - we will change this in the function handleConnections
 
 	go handleMessages()
 }
 
 func defaultPage(writer http.ResponseWriter, request *http.Request) {
 	fmt.Fprintf(writer, "Welcome")
+}
+
+// joinGame is the end point for joining an existing game.
+// This returns response 200 (StatusOK) if successful
+func joinGame(writer http.ResponseWriter, request *http.Request) {
+	defer request.Body.Close()
+
+	var player api.Player
+	if err := json.NewDecoder(request.Body).Decode(&player); err != nil {
+		respondWithError(writer, http.StatusBadRequest, "Invalid username or player information")
+		return
+	}
+	var err error
+	player.UUID = uuid.Must(uuid.NewV4(), err)
+
+	if err != nil {
+		fmt.Printf("Something went wrong: %s", err)
+	}
+
+	// Database handling here
+
+	respondWithJson(writer, http.StatusOK, player)
+	// response 200 -> redirect player to /game
 }
 
 var upgrader = websocket.Upgrader{}				// This is the websocket upgrader
@@ -92,11 +118,17 @@ func handleConnections(writer http.ResponseWriter, request *http.Request) {
 	}
 }
 
+type Command int
+const (
+	DRAW Command = 0
+	PLAY Command = 1
+)
+
 // handleMessages is a listener that continuously reads from the broadcast channel
 // If a change is received, the function will take the diff and relay it to all the clients
 func handleMessages() {
 	for {
-		// receive diff
+		// receive diff or command
 		diff := <- broadcastChannel
 
 		// send diff to every client
@@ -111,4 +143,15 @@ func handleMessages() {
 			}
 		}
 	}
+}
+
+func respondWithError(w http.ResponseWriter, code int, msg string) {
+	respondWithJson(w, code, map[string]string{"error": msg})
+}
+
+func respondWithJson(w http.ResponseWriter, code int, payload interface{}) {
+	response, _ := json.Marshal(payload)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	w.Write(response)
 }
