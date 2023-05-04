@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/fatih/color"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
@@ -22,6 +23,10 @@ func main() {
 	r.Use(middleware.Recoverer)
 
 	r.Use(middleware.Heartbeat("/ping"))
+
+	if os.Getenv("CAMBIA_ENV") != "production" {
+		log.Println(color.GreenString("INFO"), "Environment variables loaded:\n\t", strings.Join(os.Environ(), "\n\t"))
+	}
 
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins: func() []string {
@@ -43,13 +48,15 @@ func main() {
 		w.Write([]byte("hello"))
 	})
 
-	log.Println("Listening")
-
+	var addr string
 	if os.Getenv("CAMBIA_ENV") == "production" {
 		// bind to all hosts in production mode
-		log.Fatal(http.ListenAndServe(":8080", r))
+		addr = ":8080"
 	} else {
 		// otherwise bind to localhost
-		log.Fatal(http.ListenAndServe("localhost:8080", r))
+		addr = "localhost:8080"
 	}
+
+	log.Println(color.GreenString("INFO"), "Cambia server listening on", color.CyanString(addr))
+	log.Fatal(http.ListenAndServe(addr, r))
 }
