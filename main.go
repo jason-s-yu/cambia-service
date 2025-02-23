@@ -11,7 +11,7 @@ func main() {
 	s := handlers.NewGameServer(log.Printf)
 
 	http.HandleFunc("/", handlers.PingHandler)
-	http.HandleFunc("/subscribe", s.WsHandler)
+	http.HandleFunc("/game/new", s.NewGameHandler)
 
 	log.Println("Server started on :8080")
 	err := http.ListenAndServe(":8080", nil)

@@ -8,18 +8,25 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/google/uuid"
+	"github.com/jason-s-yu/cambia/game"
+	"github.com/jason-s-yu/cambia/models"
 	"golang.org/x/time/rate"
 )
 
 type GameServer struct {
-	Logf func(f string, v ...interface{})
+	GameInstance *game.Game
+	Logf         func(f string, v ...interface{})
 }
 
 func NewGameServer(logf func(f string, v ...interface{})) *GameServer {
-	return &GameServer{Logf: logf}
+	return &GameServer{
+		GameInstance: game.NewGame(),
+		Logf:         logf,
+	}
 }
 
-func (s *GameServer) WsHandler(w http.ResponseWriter, r *http.Request) {
+func (s *GameServer) NewGameHandler(w http.ResponseWriter, r *http.Request) {
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		Subprotocols: []string{"echo"},
 	})
@@ -27,6 +34,33 @@ func (s *GameServer) WsHandler(w http.ResponseWriter, r *http.Request) {
 		s.Logf("%v", err)
 		return
 	}
+
+	// Create a new player instance and store the connection
+	playerID := r.URL.Query().Get("player_id")
+	if playerID == "" {
+		s.Logf("missing player_id")
+		c.Close(websocket.StatusPolicyViolation, "missing player_id")
+		return
+	}
+
+	player := &models.Player{
+		ID: func() uuid.UUID {
+			id, err := uuid.Parse(playerID)
+			if err != nil {
+				s.Logf("invalid player_id: %v", err)
+				c.Close(websocket.StatusPolicyViolation, "invalid player_id")
+				return uuid.Nil
+			}
+			return id
+		}(),
+		Conn:      c,
+		Connected: true,
+	}
+
+	// Store the player in the game instance
+	s.GameInstance.Mutex.Lock()
+	s.GameInstance.Players = append(s.GameInstance.Players, player)
+	s.GameInstance.Mutex.Unlock()
 	defer c.CloseNow()
 
 	if c.Subprotocol() != "echo" {

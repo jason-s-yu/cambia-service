@@ -1,14 +1,14 @@
 package models
 
-import "github.com/coder/websocket"
+import (
+	"github.com/coder/websocket"
+	"github.com/google/uuid"
+)
 
 type Player struct {
-	ID              string          `json:"id"`
-	Hand            []Card          `json:"hand"`
-	Revealed        []bool          `json:"revealed"`
-	IsDealer        bool            `json:"isDealer"`
+	ID              uuid.UUID       `json:"id"`
+	Hand            []*Card         `json:"hand"`
 	Connected       bool            `json:"connected"`
 	Conn            *websocket.Conn `json:"-"`
-	Ready           bool            `json:"ready"`
 	HasCalledCambia bool            `json:"hasCalledCambia"`
 }
