@@ -1,21 +1,52 @@
 package main
 
 import (
+	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"os"
+	"os/signal"
+	"time"
 
+	_ "github.com/joho/godotenv/autoload"
+
+	"github.com/jason-s-yu/cambia/database"
 	"github.com/jason-s-yu/cambia/handlers"
 )
 
 func main() {
-	s := handlers.NewGameServer(log.Printf)
+	database.ConnectDB()
 
-	http.HandleFunc("/", handlers.PingHandler)
-	http.HandleFunc("/game/new", s.NewGameHandler)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", handlers.PingHandler)
+	mux.Handle("/game", handlers.NewGameServer())
+	mux.Handle("/game/", handlers.NewGameServer())
 
-	log.Println("Server started on :8080")
-	err := http.ListenAndServe(":8080", nil)
+	server := &http.Server{
+		Handler:      mux,
+		ReadTimeout:  time.Second * 10,
+		WriteTimeout: time.Second * 10,
+	}
+
+	l, err := net.Listen("tcp", fmt.Sprintf(":%s", os.Getenv("CAMBIA_SERVICE_PORT")))
 	if err != nil {
-		log.Fatal("ListenAndServe: ", err)
+		log.Fatalf("failed to listen: %v", err)
+	}
+
+	log.Printf("listening on %s", l.Addr())
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- server.Serve(l)
+	}()
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt)
+	select {
+	case err := <-errc:
+		log.Printf("failed to serve: %v", err)
+	case sig := <-sigs:
+		log.Printf("terminating: %v", sig)
 	}
 }

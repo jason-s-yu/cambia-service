@@ -1,110 +1,92 @@
 package handlers
 
 import (
-	"context"
-	"fmt"
-	"io"
+	"encoding/json"
+	"log"
 	"net/http"
-	"time"
 
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
 	"github.com/jason-s-yu/cambia/game"
 	"github.com/jason-s-yu/cambia/models"
-	"golang.org/x/time/rate"
 )
 
 type GameServer struct {
-	GameInstance *game.Game
-	Logf         func(f string, v ...interface{})
+	GameStore *game.GameStore
+	Logf      func(f string, v ...interface{})
 }
 
-func NewGameServer(logf func(f string, v ...interface{})) *GameServer {
-	return &GameServer{
-		GameInstance: game.NewGame(),
-		Logf:         logf,
+func NewGameServer() *GameServer {
+	gs := &GameServer{
+		GameStore: game.NewGameStore(),
+		Logf:      log.Printf,
 	}
+
+	return gs
 }
 
-func (s *GameServer) NewGameHandler(w http.ResponseWriter, r *http.Request) {
-	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		Subprotocols: []string{"echo"},
-	})
+func (s GameServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/game/create" {
+		s.CreateGameHandler(w, r)
+		return
+	}
+
+	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{"game"}})
 	if err != nil {
 		s.Logf("%v", err)
 		return
 	}
 
-	// Create a new player instance and store the connection
-	playerID := r.URL.Query().Get("player_id")
-	if playerID == "" {
-		s.Logf("missing player_id")
-		c.Close(websocket.StatusPolicyViolation, "missing player_id")
+	if c.Subprotocol() != "game" {
+		c.Close(websocket.StatusPolicyViolation, "client must speak the game subprotocol")
+		return
+	}
+
+	// ensure a game ID is supplied in the path
+	queryGameID := r.URL.Path[len("/game/"):]
+	if queryGameID == "" {
+		s.Logf("missing game_id")
+		c.Close(websocket.StatusPolicyViolation, "missing game_id")
+		return
+	}
+
+	// convert ID string to UUID
+	gameID, err := uuid.Parse(queryGameID)
+	if err != nil {
+		s.Logf("invalid game_id: %v", err)
+		c.Close(websocket.StatusPolicyViolation, "invalid uuid game_id")
+		return
+	}
+
+	// check if the game exists
+	game, ok := s.GameStore.GetGame(gameID)
+	if !ok {
+		s.Logf("game_id not found: %v", gameID)
+		c.Close(websocket.StatusPolicyViolation, "game_id not found")
 		return
 	}
 
 	player := &models.Player{
-		ID: func() uuid.UUID {
-			id, err := uuid.Parse(playerID)
-			if err != nil {
-				s.Logf("invalid player_id: %v", err)
-				c.Close(websocket.StatusPolicyViolation, "invalid player_id")
-				return uuid.Nil
-			}
-			return id
-		}(),
+		ID:        gameID,
 		Conn:      c,
 		Connected: true,
 	}
 
 	// Store the player in the game instance
-	s.GameInstance.Mutex.Lock()
-	s.GameInstance.Players = append(s.GameInstance.Players, player)
-	s.GameInstance.Mutex.Unlock()
-	defer c.CloseNow()
-
-	if c.Subprotocol() != "echo" {
-		c.Close(websocket.StatusPolicyViolation, "client must speak the echo subprotocol")
-		return
-	}
-
-	l := rate.NewLimiter(rate.Every(time.Millisecond*100), 10)
-	for {
-		err = echo(c, l)
-		if websocket.CloseStatus(err) == websocket.StatusNormalClosure {
-			return
-		}
-		if err != nil {
-			s.Logf("failed to echo with %v: %v", r.RemoteAddr, err)
-			return
-		}
-	}
+	game.Mutex.Lock()
+	game.Players = append(game.Players, player)
+	game.Mutex.Unlock()
 }
 
-func echo(c *websocket.Conn, l *rate.Limiter) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
-	defer cancel()
+func (s *GameServer) CreateGameHandler(w http.ResponseWriter, r *http.Request) {
+	g := game.NewGame()
 
-	err := l.Wait(ctx)
-	if err != nil {
-		return err
+	w.Header().Set("Content-Type", "application/json")
+
+	s.GameStore.AddGame(g)
+
+	if err := json.NewEncoder(w).Encode(g); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
-
-	typ, r, err := c.Reader(ctx)
-	if err != nil {
-		return err
-	}
-
-	w, err := c.Writer(ctx, typ)
-	if err != nil {
-		return err
-	}
-
-	_, err = io.Copy(w, r)
-	if err != nil {
-		return fmt.Errorf("failed to io.Copy: %w", err)
-	}
-
-	err = w.Close()
-	return err
 }

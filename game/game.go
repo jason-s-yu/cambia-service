@@ -26,9 +26,12 @@ func NewGame() *Game {
 		panic(err)
 	}
 	game := &Game{
-		ID:      id,
-		Players: []*models.Player{},
-		Deck:    make(map[uuid.UUID]*models.Card),
+		ID:            id,
+		Players:       []*models.Player{},
+		Deck:          make(map[uuid.UUID]*models.Card),
+		Mutex:         sync.Mutex{},
+		CurrentPlayer: -1,
+		Started:       false,
 	}
 	game.initializeDeck()
 	return game
