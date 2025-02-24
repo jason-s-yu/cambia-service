@@ -11,15 +11,43 @@ import (
 
 	_ "github.com/joho/godotenv/autoload"
 
+	"github.com/jason-s-yu/cambia/auth"
 	"github.com/jason-s-yu/cambia/database"
 	"github.com/jason-s-yu/cambia/handlers"
 )
 
-func main() {
-	database.ConnectDB()
+var flags Flags
 
+type Flags struct {
+	verbose bool
+}
+
+func main() {
+	// Parse command line flags
+	for _, arg := range os.Args[1:] {
+		if arg == "-v" {
+			flags.verbose = true
+		}
+	}
+
+	if flags.verbose {
+		log.Println("Verbose mode enabled")
+	}
+
+	// init db connection
+	database.ConnectDB()
+	defer database.DB.Close()
+
+	// init auth keys
+	auth.Init()
+
+	// init routers
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handlers.PingHandler)
+
+	mux.HandleFunc("/user/create", handlers.CreateUserHandler)
+	mux.HandleFunc("/user/login", handlers.LoginHandler)
+
 	mux.Handle("/game", handlers.NewGameServer())
 	mux.Handle("/game/", handlers.NewGameServer())
 

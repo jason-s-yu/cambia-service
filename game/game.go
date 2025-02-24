@@ -19,7 +19,10 @@ type Game struct {
 	Mutex         sync.Mutex
 }
 
-// NewGame creates a new game instance and initializes its game state.
+// NewGame creates a new Game instance, initializes its state, and returns it.
+// It generates a unique UUID for the game, initializes an empty list of players,
+// an empty deck, and sets the game as not started. It also initializes the deck
+// with cards by calling the initializeDeck method.
 func NewGame() *Game {
 	id, err := uuid.NewV7()
 	if err != nil {
@@ -28,6 +31,25 @@ func NewGame() *Game {
 	game := &Game{
 		ID:            id,
 		Players:       []*models.Player{},
+		Deck:          make(map[uuid.UUID]*models.Card),
+		Mutex:         sync.Mutex{},
+		CurrentPlayer: -1,
+		Started:       false,
+	}
+	game.initializeDeck()
+	return game
+}
+
+// NewGameWithPlayers creates a new Game instance with a specified list of players,
+// initializes its state, and returns it.
+func NewGameWithPlayers(players []*models.Player) *Game {
+	id, err := uuid.NewV7()
+	if err != nil {
+		panic(err)
+	}
+	game := &Game{
+		ID:            id,
+		Players:       players,
 		Deck:          make(map[uuid.UUID]*models.Card),
 		Mutex:         sync.Mutex{},
 		CurrentPlayer: -1,
@@ -89,13 +111,28 @@ func (g *Game) initializeDeck() {
 				Rank:  rank,
 				Value: value,
 			}
+			g.Deck[card.ID] = card
 			deck = append(deck, card)
 		}
 	}
 
 	// Add Jokers
-	deck = append(deck, &models.Card{Suit: "Joker", Rank: "Joker", Value: 0})
-	deck = append(deck, &models.Card{Suit: "Joker", Rank: "Joker", Value: 0})
+	for i := 0; i < 2; i++ {
+		card := &models.Card{
+			ID: func() uuid.UUID {
+				id, err := uuid.NewV7()
+				if err != nil {
+					panic(err)
+				}
+				return id
+			}(),
+			Suit:  "Joker",
+			Rank:  "Joker",
+			Value: 0,
+		}
+		g.Deck[card.ID] = card
+		deck = append(deck, card)
+	}
 
 	// Shuffle the deck
 	// rand.NewSource(time.Now().UnixNano())
@@ -107,7 +144,7 @@ func (g *Game) initializeDeck() {
 	g.DiscardPile = []*models.Card{}
 }
 
-// DrawFromDeck draws a card from the stockpile
+// DrawFromDeck draws a card from the stockpile and returns a reference to it.
 func (g *Game) DrawFromStockpile() *models.Card {
 	if len(g.Stockpile) == 0 {
 		// Reshuffle discard pile into deck
@@ -123,7 +160,7 @@ func (g *Game) DrawFromStockpile() *models.Card {
 	return card
 }
 
-// DiscardCard adds the card to the discard pile
+// DiscardCard adds the card reference to the discard pile.
 func (g *Game) DiscardCard(card *models.Card) {
 	g.DiscardPile = append(g.DiscardPile, card)
 }

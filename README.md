@@ -35,8 +35,6 @@
    go mod tidy
    ```
 
-   This will download the required dependencies specified in the `go.mod` file.
-
 ### Running the Server
 
 Run the server using the `go run` command:
@@ -46,6 +44,12 @@ go run main.go
 ```
 
 The server will start and listen on `http://localhost:8080`.
+
+Alternatively, using Air for hot-reloading:
+
+```bash
+air
+```
 
 ## License
 
