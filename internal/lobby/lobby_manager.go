@@ -50,7 +50,7 @@ func (lm *LobbyManager) GetOrCreateLobbyState(lobbyID uuid.UUID) *LobbyState {
 			LobbyID:     lobbyID,
 			Connections: make(map[uuid.UUID]*LobbyConnection),
 			ReadyStates: make(map[uuid.UUID]bool),
-			AutoStart:   false,
+			AutoStart:   true, // default to auto-start
 		}
 		lm.lobbies[lobbyID] = ls
 	}
@@ -68,7 +68,7 @@ func (lm *LobbyManager) RemoveLobbyState(lobbyID uuid.UUID) {
 // It also broadcasts a "countdown_started" message to clients.
 func (ls *LobbyState) StartCountdown(seconds int) {
 	if ls.CountdownTimer != nil {
-		// already counting down
+		// disregard this call if we're already counting down
 		return
 	}
 	ls.BroadcastAll(map[string]interface{}{
@@ -93,6 +93,17 @@ func (ls *LobbyState) CancelCountdown() {
 			"type": "countdown_interrupted",
 		})
 	}
+}
+
+// UpdateRules updates local memory rules. For now we only handle "auto_start".
+func (ls *LobbyState) UpdateRules(newRules map[string]interface{}) {
+	if as, ok := newRules["auto_start"].(bool); ok {
+		ls.AutoStart = as
+	}
+	ls.BroadcastAll(map[string]interface{}{
+		"type":      "rule_update_ack",
+		"autoStart": ls.AutoStart,
+	})
 }
 
 // MarkUserReady checks if the user is connected and sets their ready state.

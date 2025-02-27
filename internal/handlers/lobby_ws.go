@@ -13,10 +13,11 @@ import (
 	"github.com/jason-s-yu/cambia/internal/auth"
 	"github.com/jason-s-yu/cambia/internal/database"
 	"github.com/jason-s-yu/cambia/internal/lobby"
+	"github.com/jason-s-yu/cambia/internal/models"
 	"github.com/sirupsen/logrus"
 )
 
-// We'll keep a reference to the GameServer so we can check player's game socket connections.
+// We'll keep a reference to the GameServer so we can create the game instance upon start game command
 var gameSrvForLobbyWS *GameServer
 
 // LobbyWSHandler returns an http.HandlerFunc that upgrades to a WebSocket
@@ -141,14 +142,6 @@ func handleLobbyMessage(packet map[string]interface{}, ls *lobby.LobbyState, con
 	action, _ := packet["type"].(string)
 	switch action {
 	case "ready":
-		// verify user is connected to the game server
-		if !isUserConnectedToGame(lobbyID, conn.UserID) {
-			conn.OutChan <- map[string]interface{}{
-				"type":    "error",
-				"message": "You must connect to the game server WebSocket before readying",
-			}
-			return
-		}
 		ls.MarkUserReady(conn.UserID)
 		if ls.AutoStart && ls.AreAllReady() {
 			ls.StartCountdown(10)
@@ -165,9 +158,13 @@ func handleLobbyMessage(packet map[string]interface{}, ls *lobby.LobbyState, con
 	case "chat":
 		msg, _ := packet["msg"].(string)
 		ls.BroadcastChat(conn.UserID, msg)
+	case "rule_update":
+		// host can update auto_start, etc.
+		if rules, ok := packet["rules"].(map[string]interface{}); ok {
+			ls.UpdateRules(rules)
+		}
 	case "start_game":
-		// host wants to forcibly start
-		// check all players are ready & connected, if so "start" the game
+		// host forcibly starts the game (or countdown ended).
 		if !ls.AreAllReady() {
 			conn.OutChan <- map[string]interface{}{
 				"type":    "error",
@@ -175,44 +172,26 @@ func handleLobbyMessage(packet map[string]interface{}, ls *lobby.LobbyState, con
 			}
 			return
 		}
-		if !allUsersConnectedToGame(lobbyID, ls) {
-			conn.OutChan <- map[string]interface{}{
-				"type":    "error",
-				"message": "Some players not connected to the game server",
-			}
-			return
-		}
 		ls.CancelCountdown()
+		// create game now
+		g := gameSrvForLobbyWS.NewCambiaGameFromLobby(context.Background(), fetchLobbyFromDB(lobbyID, logger))
 		ls.BroadcastAll(map[string]interface{}{
-			"type": "game_started",
+			"type":    "game_start",
+			"game_id": g.ID.String(),
 		})
 	default:
 		logger.Warnf("unknown action %s from user %v", action, conn.UserID)
 	}
 }
 
-func isUserConnectedToGame(lobbyID, userID uuid.UUID) bool {
-	// We find the game that was created for this lobby (we assume same ID or a mapping).
-	g := gameSrvForLobbyWS.GameStore.GetGameByLobbyID(lobbyID)
-	if g == nil {
-		return false
+// fetchLobbyFromDB is a helper to load the lobby from DB so we can pass it into NewCambiaGameFromLobby.
+func fetchLobbyFromDB(lobbyID uuid.UUID, logger *logrus.Logger) *models.Lobby {
+	lob, err := database.GetLobby(context.Background(), lobbyID)
+	if err != nil {
+		logger.Warnf("failed to fetch lobby %v: %v", lobbyID, err)
+		return &models.Lobby{ID: lobbyID}
 	}
-	for _, p := range g.Players {
-		if p.ID == userID && p.Connected {
-			return true
-		}
-	}
-	return false
-}
-
-// allUsersConnectedToGame checks if all players in the lobby are connected to the game.
-func allUsersConnectedToGame(lobbyID uuid.UUID, ls *lobby.LobbyState) bool {
-	for uid := range ls.ReadyStates {
-		if !isUserConnectedToGame(lobbyID, uid) {
-			return false
-		}
-	}
-	return true
+	return lob
 }
 
 // writePump writes messages from conn.OutChan to the websocket until context is canceled.

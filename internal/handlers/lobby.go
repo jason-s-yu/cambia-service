@@ -143,13 +143,6 @@ func CreateLobbyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// create a new CambiaGame using game server
-	// for that we might need a global or pass the game server reference somehow
-	// for simplicity, let's do an ephemeral approach:
-	g := GlobalGameServer.NewCambiaGameFromLobby(ctx, &lobby)
-	gameID := g.ID
-
-	// return the newly created lobby along with the rules and the game_id
 	resp := map[string]interface{}{
 		"id":           lobby.ID.String(),
 		"host_user_id": lobby.HostUserID.String(),
@@ -165,7 +158,6 @@ func CreateLobbyHandler(w http.ResponseWriter, r *http.Request) {
 			"penalty_card_count":                lobby.PenaltyCardCount,
 			"allow_replaced_discard_abilities":  lobby.AllowReplacedDiscardAbilities,
 		},
-		"game_id": gameID.String(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -289,13 +281,12 @@ func StartLobbyGameHandler(gs *GameServer) http.HandlerFunc {
 
 // ListLobbiesHandler returns all lobbies in the DB, primarily for debugging or admin usage.
 func ListLobbiesHandler(w http.ResponseWriter, r *http.Request) {
-	// TODO: partitioning for private/public lobby
 	cookie := r.Header.Get("Cookie")
 	if !strings.Contains(cookie, "auth_token=") {
 		http.Error(w, "missing auth_token", http.StatusUnauthorized)
 		return
 	}
-	token := extractCookieToken(cookie, "auth_token")
+	token := extractTokenFromCookie(cookie)
 	if _, err := auth.AuthenticateJWT(token); err != nil {
 		http.Error(w, "invalid token", http.StatusForbidden)
 		return
@@ -306,8 +297,55 @@ func ListLobbiesHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("failed to list lobbies: %v", err), http.StatusInternalServerError)
 		return
 	}
+
+	type lobbyResp struct {
+		ID         string `json:"id"`
+		HostUserID string `json:"host_user_id"`
+		Type       string `json:"type"`
+
+		CircuitMode bool   `json:"circuit_mode"`
+		Ranked      bool   `json:"ranked"`
+		RankingMode string `json:"ranking_mode"`
+
+		DisconnectionThreshold        int  `json:"disconnection_threshold"`
+		HouseRuleFreezeDisconnect     bool `json:"house_rule_freeze_disconnect"`
+		HouseRuleForfeitDisconnect    bool `json:"house_rule_forfeit_disconnect"`
+		HouseRuleMissedRoundThreshold int  `json:"house_rule_missed_round_threshold"`
+		PenaltyCardCount              int  `json:"penalty_card_count"`
+		AllowReplacedDiscardAbilities bool `json:"allow_replaced_discard_abilities"`
+
+		Rules map[string]interface{} `json:"rules"`
+	}
+
+	var resp []lobbyResp
+	for _, l := range lobbies {
+		rmap := map[string]interface{}{
+			"disconnection_threshold":           l.DisconnectionThreshold,
+			"house_rule_freeze_disconnect":      l.HouseRuleFreezeDisconnect,
+			"house_rule_forfeit_disconnect":     l.HouseRuleForfeitDisconnect,
+			"house_rule_missed_round_threshold": l.HouseRuleMissedRoundThreshold,
+			"penalty_card_count":                l.PenaltyCardCount,
+			"allow_replaced_discard_abilities":  l.AllowReplacedDiscardAbilities,
+		}
+		resp = append(resp, lobbyResp{
+			ID:                            l.ID.String(),
+			HostUserID:                    l.HostUserID.String(),
+			Type:                          l.Type,
+			CircuitMode:                   l.CircuitMode,
+			Ranked:                        l.Ranked,
+			RankingMode:                   l.RankingMode,
+			DisconnectionThreshold:        l.DisconnectionThreshold,
+			HouseRuleFreezeDisconnect:     l.HouseRuleFreezeDisconnect,
+			HouseRuleForfeitDisconnect:    l.HouseRuleForfeitDisconnect,
+			HouseRuleMissedRoundThreshold: l.HouseRuleMissedRoundThreshold,
+			PenaltyCardCount:              l.PenaltyCardCount,
+			AllowReplacedDiscardAbilities: l.AllowReplacedDiscardAbilities,
+			Rules:                         rmap,
+		})
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(lobbies)
+	json.NewEncoder(w).Encode(resp)
 }
 
 // GetLobbyHandler returns a single lobby by ID, if it exists.
