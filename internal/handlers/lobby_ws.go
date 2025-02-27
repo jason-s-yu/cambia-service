@@ -18,7 +18,7 @@ import (
 )
 
 // We'll keep a reference to the GameServer so we can create the game instance upon start game command
-var gameSrvForLobbyWS *GameServer
+var GameServerForLobbyWS *GameServer
 
 // LobbyWSHandler returns an http.HandlerFunc that upgrades to a WebSocket
 // for the given lobby, subprotocol "lobby". It uses a LobbyManager to track real-time state.
@@ -37,7 +37,7 @@ var gameSrvForLobbyWS *GameServer
 // Returns:
 // - An http.HandlerFunc that handles the WebSocket connection.
 func LobbyWSHandler(logger *logrus.Logger, lm *lobby.LobbyManager, gs *GameServer) http.HandlerFunc {
-	gameSrvForLobbyWS = gs
+	GameServerForLobbyWS = gs
 	return func(w http.ResponseWriter, r *http.Request) {
 		pathParts := strings.Split(strings.TrimPrefix(r.URL.Path, "/lobby/ws/"), "/")
 		if len(pathParts) < 1 {
@@ -164,6 +164,14 @@ func handleLobbyMessage(packet map[string]interface{}, ls *lobby.LobbyState, con
 			ls.UpdateRules(rules)
 		}
 	case "start_game":
+		// check if we're in a game already
+		if ls.InGame {
+			conn.OutChan <- map[string]interface{}{
+				"type":    "error",
+				"message": "Game already in progress",
+			}
+			return
+		}
 		// host forcibly starts the game (or countdown ended).
 		if !ls.AreAllReady() {
 			conn.OutChan <- map[string]interface{}{
@@ -174,7 +182,7 @@ func handleLobbyMessage(packet map[string]interface{}, ls *lobby.LobbyState, con
 		}
 		ls.CancelCountdown()
 		// create game now
-		g := gameSrvForLobbyWS.NewCambiaGameFromLobby(context.Background(), fetchLobbyFromDB(lobbyID, logger))
+		g := GameServerForLobbyWS.NewCambiaGameFromLobby(context.Background(), fetchLobbyFromDB(lobbyID, logger))
 		ls.BroadcastAll(map[string]interface{}{
 			"type":    "game_start",
 			"game_id": g.ID.String(),
