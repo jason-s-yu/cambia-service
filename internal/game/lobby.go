@@ -1,5 +1,5 @@
-// internal/lobby/lobby_manager.go
-package lobby
+// internal/game/lobby_manager.go
+package game
 
 import (
 	"context"

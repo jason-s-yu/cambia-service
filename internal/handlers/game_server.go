@@ -10,12 +10,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/jason-s-yu/cambia/internal/database"
 	"github.com/jason-s-yu/cambia/internal/game"
-	"github.com/jason-s-yu/cambia/internal/lobby"
 	"github.com/jason-s-yu/cambia/internal/models"
 )
 
 // GlobalLobbyManager is needed so we can broadcast the end-of-game results to the right lobby
-var GlobalLobbyManager *lobby.LobbyManager
+var GlobalLobbyManager *game.LobbyManager
 
 // GameServer is a high-level struct that holds a reference to a GameStore
 // and can create new games from lobbies

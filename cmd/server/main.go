@@ -8,8 +8,8 @@ import (
 
 	"github.com/jason-s-yu/cambia/internal/auth"
 	"github.com/jason-s-yu/cambia/internal/database"
+	"github.com/jason-s-yu/cambia/internal/game"
 	"github.com/jason-s-yu/cambia/internal/handlers"
-	"github.com/jason-s-yu/cambia/internal/lobby"
 	"github.com/jason-s-yu/cambia/internal/middleware"
 	_ "github.com/joho/godotenv/autoload"
 	"github.com/sirupsen/logrus"
@@ -39,7 +39,7 @@ func main() {
 	handlers.GlobalGameServer = gameSrv
 
 	// lobby manager
-	lm := lobby.NewLobbyManager()
+	lm := game.NewLobbyManager()
 	handlers.GlobalLobbyManager = lm
 
 	mux.Handle("/game/ws/", middleware.LogMiddleware(logger)(http.HandlerFunc(

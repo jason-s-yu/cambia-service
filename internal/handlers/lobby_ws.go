@@ -12,7 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jason-s-yu/cambia/internal/auth"
 	"github.com/jason-s-yu/cambia/internal/database"
-	"github.com/jason-s-yu/cambia/internal/lobby"
+	"github.com/jason-s-yu/cambia/internal/game"
 	"github.com/jason-s-yu/cambia/internal/models"
 	"github.com/sirupsen/logrus"
 )
@@ -22,12 +22,12 @@ var GameServerForLobbyWS *GameServer
 
 // LobbyWSHandler returns an http.HandlerFunc that upgrades to a WebSocket
 // for the given lobby, subprotocol "lobby". It uses a LobbyManager to track real-time state.
-// LobbyWSHandler handles WebSocket connections for a lobby.
+// LobbyWSHandler handles WebSocket connections for a game.
 // It performs the following steps:
 // 1. Parses {lobby_id} from the request path.
 // 2. Checks if the subprotocol is "lobby".
 // 3. Authenticates the user using the auth_token from the cookie.
-// 4. Verifies if the user is a participant in the specified lobby.
+// 4. Verifies if the user is a participant in the specified game.
 // 5. Accepts the WebSocket connection, tracks it in the LobbyManager, and starts the read loop.
 //
 // Parameters:
@@ -36,7 +36,7 @@ var GameServerForLobbyWS *GameServer
 //
 // Returns:
 // - An http.HandlerFunc that handles the WebSocket connection.
-func LobbyWSHandler(logger *logrus.Logger, lm *lobby.LobbyManager, gs *GameServer) http.HandlerFunc {
+func LobbyWSHandler(logger *logrus.Logger, lm *game.LobbyManager, gs *GameServer) http.HandlerFunc {
 	GameServerForLobbyWS = gs
 	return func(w http.ResponseWriter, r *http.Request) {
 		pathParts := strings.Split(strings.TrimPrefix(r.URL.Path, "/lobby/ws/"), "/")
@@ -93,7 +93,7 @@ func LobbyWSHandler(logger *logrus.Logger, lm *lobby.LobbyManager, gs *GameServe
 		ls := lm.GetOrCreateLobbyState(lobbyUUID)
 
 		ctx, cancel := context.WithCancel(r.Context())
-		conn := &lobby.LobbyConnection{
+		conn := &game.LobbyConnection{
 			UserID:  userUUID,
 			Cancel:  cancel,
 			OutChan: make(chan map[string]interface{}, 10),
@@ -111,7 +111,7 @@ func LobbyWSHandler(logger *logrus.Logger, lm *lobby.LobbyManager, gs *GameServe
 }
 
 // readPump reads messages from the websocket until disconnect. We handle JSON commands here.
-func readPump(ctx context.Context, c *websocket.Conn, ls *lobby.LobbyState, conn *lobby.LobbyConnection, logger *logrus.Logger, lobbyID uuid.UUID) {
+func readPump(ctx context.Context, c *websocket.Conn, ls *game.LobbyState, conn *game.LobbyConnection, logger *logrus.Logger, lobbyID uuid.UUID) {
 	defer func() {
 		ls.RemoveUser(conn.UserID)
 		conn.Cancel()
@@ -139,7 +139,7 @@ func readPump(ctx context.Context, c *websocket.Conn, ls *lobby.LobbyState, conn
 }
 
 // handleLobbyMessage interprets the "type" field received by client and updates the lobby or broadcasts accordingly.
-func handleLobbyMessage(packet map[string]interface{}, ls *lobby.LobbyState, conn *lobby.LobbyConnection, logger *logrus.Logger, lobbyID uuid.UUID) {
+func handleLobbyMessage(packet map[string]interface{}, ls *game.LobbyState, conn *game.LobbyConnection, logger *logrus.Logger, lobbyID uuid.UUID) {
 	action, _ := packet["type"].(string)
 	switch action {
 	case "ready":
@@ -204,7 +204,7 @@ func handleLobbyMessage(packet map[string]interface{}, ls *lobby.LobbyState, con
 	}
 }
 
-// fetchLobbyFromDB is a helper to load the lobby from DB so we can pass it into NewCambiaGameFromLobby.
+// fetchLobbyFromDB is a helper to load the lobby from DB so we can pass it into NewCambiaGameFromgame.
 func fetchLobbyFromDB(lobbyID uuid.UUID, logger *logrus.Logger) *models.Lobby {
 	lob, err := database.GetLobby(context.Background(), lobbyID)
 	if err != nil {
@@ -215,7 +215,7 @@ func fetchLobbyFromDB(lobbyID uuid.UUID, logger *logrus.Logger) *models.Lobby {
 }
 
 // writePump writes messages from conn.OutChan to the websocket until context is canceled.
-func writePump(ctx context.Context, c *websocket.Conn, conn *lobby.LobbyConnection, logger *logrus.Logger) {
+func writePump(ctx context.Context, c *websocket.Conn, conn *game.LobbyConnection, logger *logrus.Logger) {
 	for {
 		select {
 		case <-ctx.Done():
