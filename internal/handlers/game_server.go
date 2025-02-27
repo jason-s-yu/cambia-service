@@ -33,21 +33,21 @@ func NewGameServer() *GameServer {
 }
 
 // NewCambiaGameFromLobby fetches participants, creates an in-memory CambiaGame
-func (gs *GameServer) NewCambiaGameFromLobby(ctx context.Context, lob *models.Lobby) *game.CambiaGame {
+func (gs *GameServer) NewCambiaGameFromLobby(ctx context.Context, lobby *models.Lobby) *game.CambiaGame {
 	g := game.NewCambiaGame()
-	g.LobbyID = lob.ID
+	g.LobbyID = lobby.ID
 
-	g.HouseRules.FreezeOnDisconnect = lob.HouseRuleFreezeDisconnect
-	g.HouseRules.ForfeitOnDisconnect = lob.HouseRuleForfeitDisconnect
-	g.HouseRules.MissedRoundThreshold = lob.HouseRuleMissedRoundThreshold
-	g.HouseRules.PenaltyCardCount = lob.PenaltyCardCount
-	g.HouseRules.AllowDiscardAbilities = lob.AllowReplacedDiscardAbilities
-	g.HouseRules.DisconnectionRoundLimit = lob.DisconnectionThreshold
+	g.HouseRules.FreezeOnDisconnect = lobby.HouseRuleFreezeDisconnect
+	g.HouseRules.ForfeitOnDisconnect = lobby.HouseRuleForfeitDisconnect
+	g.HouseRules.MissedRoundThreshold = lobby.HouseRuleMissedRoundThreshold
+	g.HouseRules.PenaltyCardCount = lobby.PenaltyCardCount
+	g.HouseRules.AllowDiscardAbilities = lobby.AllowReplacedDiscardAbilities
+	g.HouseRules.DisconnectionRoundLimit = lobby.DisconnectionThreshold
 	g.HouseRules.TurnTimeoutSec = 15 // default
 
-	participants, err := fetchLobbyParticipants(ctx, lob.ID)
+	participants, err := fetchLobbyParticipants(ctx, lobby.ID)
 	if err != nil {
-		log.Printf("error fetching participants for lobby %v: %v\n", lob.ID, err)
+		log.Printf("error fetching participants for lobby %v: %v\n", lobby.ID, err)
 	}
 	g.Players = participants
 
