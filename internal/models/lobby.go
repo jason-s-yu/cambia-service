@@ -2,10 +2,11 @@ package models
 
 import "github.com/google/uuid"
 
+// Lobby represents a row in the lobbies table, possibly referencing the new 'lobby_type' enum.
 type Lobby struct {
 	ID                     uuid.UUID `json:"id"`
 	HostUserID             uuid.UUID `json:"host_user_id"`
-	Type                   string    `json:"type"` // 'public', 'private', 'matchmaking'
+	Type                   string    `json:"type"` // 'private', 'public', or 'matchmaking'
 	CircuitMode            bool      `json:"circuit_mode"`
 	Ranked                 bool      `json:"ranked"`
 	RankingMode            string    `json:"ranking_mode"`

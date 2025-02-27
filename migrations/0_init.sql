@@ -1,5 +1,13 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
+-- Create an enum for Lobby 'type'
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'lobby_type') THEN
+        CREATE TYPE lobby_type AS ENUM ('private', 'public', 'matchmaking');
+    END IF;
+END$$;
+
 -- ==============
 --  USERS TABLE
 -- ==============
@@ -38,8 +46,8 @@ CREATE TABLE IF NOT EXISTS friends (
 CREATE TABLE IF NOT EXISTS lobbies (
     id                                UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
     host_user_id                      UUID REFERENCES users(id) NOT NULL,
-    type                              TEXT NOT NULL,  -- 'private' or 'public'
-    mode                              TEXT,           -- 'head_to_head', 'group_of_4', 'circuit_4p', 'circuit_7p8p', etc.
+    type                              lobby_type NOT NULL,  -- 'private', 'public', 'matchmaking'
+    mode                              TEXT,                 -- 'head_to_head', 'group_of_4', 'circuit_4p', 'circuit_7p8p', etc.
     house_rule_freeze_disconnect      BOOLEAN NOT NULL DEFAULT FALSE,
     house_rule_forfeit_disconnect     BOOLEAN NOT NULL DEFAULT FALSE,
     house_rule_missed_round_threshold SMALLINT NOT NULL DEFAULT 2,

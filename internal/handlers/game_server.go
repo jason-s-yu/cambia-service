@@ -3,17 +3,24 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"sync"
 
 	"github.com/google/uuid"
 	"github.com/jason-s-yu/cambia/internal/database"
 	"github.com/jason-s-yu/cambia/internal/game"
+	"github.com/jason-s-yu/cambia/internal/lobby"
 	"github.com/jason-s-yu/cambia/internal/models"
 )
 
+// GlobalLobbyManager is needed so we can broadcast the end-of-game results to the right lobby
+var GlobalLobbyManager *lobby.LobbyManager
+
 // GameServer is a high-level struct that holds a reference to a GameStore
-// and can create new games from lobbies, etc.
+// and can create new games from lobbies
 type GameServer struct {
+	Mutex     sync.Mutex
 	GameStore *game.GameStore
 	Logf      func(f string, v ...interface{})
 }
@@ -25,34 +32,45 @@ func NewGameServer() *GameServer {
 	}
 }
 
-// NewCambiaGameFromLobby fetches participants, creates an in-memory CambiaGame, starts it.
-func (gs *GameServer) NewCambiaGameFromLobby(ctx context.Context, lobby *models.Lobby) *game.CambiaGame {
-	// create a new game
+// NewCambiaGameFromLobby fetches participants, creates an in-memory CambiaGame
+func (gs *GameServer) NewCambiaGameFromLobby(ctx context.Context, lob *models.Lobby) *game.CambiaGame {
 	g := game.NewCambiaGame()
+	g.LobbyID = lob.ID
 
-	// copy relevant house rules from the lobby
-	g.HouseRules.FreezeOnDisconnect = lobby.HouseRuleFreezeDisconnect
-	g.HouseRules.ForfeitOnDisconnect = lobby.HouseRuleForfeitDisconnect
-	g.HouseRules.MissedRoundThreshold = lobby.HouseRuleMissedRoundThreshold
-	g.HouseRules.PenaltyCardCount = lobby.PenaltyCardCount
-	g.HouseRules.AllowDiscardAbilities = lobby.AllowReplacedDiscardAbilities
-	g.HouseRules.DisconnectionRoundLimit = lobby.DisconnectionThreshold
+	g.HouseRules.FreezeOnDisconnect = lob.HouseRuleFreezeDisconnect
+	g.HouseRules.ForfeitOnDisconnect = lob.HouseRuleForfeitDisconnect
+	g.HouseRules.MissedRoundThreshold = lob.HouseRuleMissedRoundThreshold
+	g.HouseRules.PenaltyCardCount = lob.PenaltyCardCount
+	g.HouseRules.AllowDiscardAbilities = lob.AllowReplacedDiscardAbilities
+	g.HouseRules.DisconnectionRoundLimit = lob.DisconnectionThreshold
+	g.HouseRules.TurnTimeoutSec = 15 // default
 
-	// defaulting to 15
-	g.HouseRules.TurnTimeoutSec = 15
-
-	// fetch participants from DB
-	participants, err := fetchLobbyParticipants(ctx, lobby.ID)
+	participants, err := fetchLobbyParticipants(ctx, lob.ID)
 	if err != nil {
-		log.Printf("error fetching participants for lobby %v: %v\n", lobby.ID, err)
+		log.Printf("error fetching participants for lobby %v: %v\n", lob.ID, err)
 	}
 	g.Players = participants
 
-	// add game to store
-	gs.GameStore.AddGame(g)
+	// Set OnGameEnd callback
+	g.OnGameEnd = func(lobbyID uuid.UUID, winner uuid.UUID, scores map[uuid.UUID]int) {
+		// broadcast to the lobby that the game ended, reset readiness
+		ls := GlobalLobbyManager.GetOrCreateLobbyState(lobbyID) // or if we have an existing state
+		for uid := range ls.ReadyStates {
+			ls.ReadyStates[uid] = false
+		}
+		resultMsg := map[string]interface{}{
+			"type":   "game_results",
+			"winner": winner.String(),
+			"scores": map[string]int{},
+		}
+		for pid, sc := range scores {
+			resultMsg["scores"].(map[string]int)[pid.String()] = sc
+		}
+		ls.BroadcastChat(winner, fmt.Sprintf("Game ended, winner is %v", winner))
+		ls.BroadcastCustom(resultMsg)
+	}
 
-	// start the game
-	g.Start()
+	gs.GameStore.AddGame(g)
 	return g
 }
 

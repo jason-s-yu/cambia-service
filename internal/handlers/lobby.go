@@ -16,6 +16,13 @@ import (
 	"github.com/jason-s-yu/cambia/internal/models"
 )
 
+// validLobbyTypes enumerates the only allowed lobby type strings
+var ValidLobbyTypes = map[string]bool{
+	"private":     true,
+	"public":      true,
+	"matchmaking": true,
+}
+
 // GlobalGameServer is the global instance that can be set by InitLobbyHandlers, if desired.
 var GlobalGameServer *GameServer
 
@@ -24,18 +31,51 @@ func InitLobbyHandlers(gs *GameServer) {
 	GlobalGameServer = gs
 }
 
-// CreateLobbyHandler handles the creation of a new lobby.
+// CreateLobbyHandler handles the creation of a new lobby. It also creates a new CambiaGame
+// and returns the "game_id" in the response so clients can connect to the game WS.
 //
-// It reads the JSON payload, which includes "type", "circuit_mode", "ranked",
-// and now a "rules" object containing house rule config. It then inserts a row
-// in the DB's "lobbies" table and auto-adds the host as a participant.
+// JSON request structure:
+//
+//	{
+//	  "type": "private",
+//	  "circuit_mode": false,
+//	  "ranked": false,
+//	  "ranking_mode": "1v1",
+//	  "rules": {
+//	    "disconnection_threshold": 2,
+//	    "house_rule_freeze_disconnect": false,
+//	    "house_rule_forfeit_disconnect": false,
+//	    "house_rule_missed_round_threshold": 2,
+//	    "penalty_card_count": 2,
+//	    "allow_replaced_discard_abilities": false
+//	  }
+//	}
+//
+// Sample response:
+//
+//	{
+//	  "id": "...",
+//	  "host_user_id": "...",
+//	  "type": "private",
+//	  "circuit_mode": false,
+//	  "ranked": false,
+//	  "ranking_mode": "1v1",
+//	  "disconnection_threshold": 2,
+//	  ...
+//	  "rules": {
+//	    "disconnection_threshold": 2,
+//	    "house_rule_freeze_disconnect": false,
+//	    ...
+//	  },
+//	  "game_id": "<some-game-id>"
+//	}
 func CreateLobbyHandler(w http.ResponseWriter, r *http.Request) {
 	cookie := r.Header.Get("Cookie")
 	if !strings.Contains(cookie, "auth_token=") {
 		http.Error(w, "missing auth_token", http.StatusUnauthorized)
 		return
 	}
-	token := extractTokenFromCookie(cookie)
+	token := extractCookieToken(cookie, "auth_token")
 
 	userIDStr, err := auth.AuthenticateJWT(token)
 	if err != nil {
@@ -68,6 +108,10 @@ func CreateLobbyHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad lobby request payload", http.StatusBadRequest)
 		return
 	}
+	if !ValidLobbyTypes[req.Type] {
+		http.Error(w, fmt.Sprintf("invalid lobby type '%s'", req.Type), http.StatusBadRequest)
+		return
+	}
 
 	lobbyID := uuid.Must(uuid.NewRandom())
 	lobby := models.Lobby{
@@ -87,21 +131,45 @@ func CreateLobbyHandler(w http.ResponseWriter, r *http.Request) {
 		AllowReplacedDiscardAbilities: req.Rules.AllowReplacedDiscardAbilities,
 	}
 
-	if err := database.InsertLobby(r.Context(), &lobby); err != nil {
-		log.Printf("failed to create lobby: %v", err)
-		http.Error(w, "database error inserting lobby", http.StatusInternalServerError)
+	ctx := r.Context()
+	if err := database.InsertLobby(ctx, &lobby); err != nil {
+		http.Error(w, fmt.Sprintf("failed to create lobby: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Auto-join the host
-	if err := database.InsertParticipant(r.Context(), lobbyID, userID, 1); err != nil {
-		log.Printf("failed to insert host participant: %v", err)
-		http.Error(w, "database error inserting host", http.StatusInternalServerError)
+	// auto-join the host
+	if err := database.InsertParticipant(ctx, lobbyID, userID, 1); err != nil {
+		http.Error(w, fmt.Sprintf("failed to insert host participant: %v", err), http.StatusInternalServerError)
 		return
+	}
+
+	// create a new CambiaGame using game server
+	// for that we might need a global or pass the game server reference somehow
+	// for simplicity, let's do an ephemeral approach:
+	g := GlobalGameServer.NewCambiaGameFromLobby(ctx, &lobby)
+	gameID := g.ID
+
+	// return the newly created lobby along with the rules and the game_id
+	resp := map[string]interface{}{
+		"id":           lobby.ID.String(),
+		"host_user_id": lobby.HostUserID.String(),
+		"type":         lobby.Type,
+		"circuit_mode": lobby.CircuitMode,
+		"ranked":       lobby.Ranked,
+		"ranking_mode": lobby.RankingMode,
+		"rules": map[string]interface{}{
+			"disconnection_threshold":           lobby.DisconnectionThreshold,
+			"house_rule_freeze_disconnect":      lobby.HouseRuleFreezeDisconnect,
+			"house_rule_forfeit_disconnect":     lobby.HouseRuleForfeitDisconnect,
+			"house_rule_missed_round_threshold": lobby.HouseRuleMissedRoundThreshold,
+			"penalty_card_count":                lobby.PenaltyCardCount,
+			"allow_replaced_discard_abilities":  lobby.AllowReplacedDiscardAbilities,
+		},
+		"game_id": gameID.String(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(lobby)
+	json.NewEncoder(w).Encode(resp)
 }
 
 // JoinLobbyHandler handles a request by a user to join an existing lobby.
@@ -278,7 +346,6 @@ func GetLobbyHandler(w http.ResponseWriter, r *http.Request) {
 
 // DeleteLobbyHandler removes a lobby from the DB, if the user is the host or an admin.
 func DeleteLobbyHandler(w http.ResponseWriter, r *http.Request) {
-	// only admin or host can delete
 	cookie := r.Header.Get("Cookie")
 	if !strings.Contains(cookie, "auth_token=") {
 		http.Error(w, "missing auth_token", http.StatusUnauthorized)

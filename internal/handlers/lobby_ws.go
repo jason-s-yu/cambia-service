@@ -16,6 +16,9 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// We'll keep a reference to the GameServer so we can check player's game socket connections.
+var gameSrvForLobbyWS *GameServer
+
 // LobbyWSHandler returns an http.HandlerFunc that upgrades to a WebSocket
 // for the given lobby, subprotocol "lobby". It uses a LobbyManager to track real-time state.
 // LobbyWSHandler handles WebSocket connections for a lobby.
@@ -32,7 +35,8 @@ import (
 //
 // Returns:
 // - An http.HandlerFunc that handles the WebSocket connection.
-func LobbyWSHandler(logger *logrus.Logger, lm *lobby.LobbyManager) http.HandlerFunc {
+func LobbyWSHandler(logger *logrus.Logger, lm *lobby.LobbyManager, gs *GameServer) http.HandlerFunc {
+	gameSrvForLobbyWS = gs
 	return func(w http.ResponseWriter, r *http.Request) {
 		pathParts := strings.Split(strings.TrimPrefix(r.URL.Path, "/lobby/ws/"), "/")
 		if len(pathParts) < 1 {
@@ -59,7 +63,6 @@ func LobbyWSHandler(logger *logrus.Logger, lm *lobby.LobbyManager) http.HandlerF
 			return
 		}
 
-		// Auth
 		token := extractCookieToken(r.Header.Get("Cookie"), "auth_token")
 		userIDStr, err := auth.AuthenticateJWT(token)
 		if err != nil {
@@ -67,17 +70,16 @@ func LobbyWSHandler(logger *logrus.Logger, lm *lobby.LobbyManager) http.HandlerF
 			c.Close(websocket.StatusPolicyViolation, "invalid auth_token")
 			return
 		}
-		userID, err := uuid.Parse(userIDStr)
+		userUUID, err := uuid.Parse(userIDStr)
 		if err != nil {
 			logger.Warnf("invalid userID parse: %v", err)
 			c.Close(websocket.StatusPolicyViolation, "invalid user ID")
 			return
 		}
 
-		// Check DB: is user in that lobby?
-		inLobby, dbErr := database.IsUserInLobby(r.Context(), lobbyUUID, userID)
+		inLobby, dbErr := database.IsUserInLobby(r.Context(), lobbyUUID, userUUID)
 		if dbErr != nil {
-			logger.Warnf("db error checking membership: %v", dbErr)
+			logger.Warnf("db error: %v", dbErr)
 			c.Close(websocket.StatusInternalError, "db error")
 			return
 		}
@@ -87,33 +89,28 @@ func LobbyWSHandler(logger *logrus.Logger, lm *lobby.LobbyManager) http.HandlerF
 			return
 		}
 
-		// If ok, register user in LobbyManager
 		ls := lm.GetOrCreateLobbyState(lobbyUUID)
 		ctx, cancel := context.WithCancel(r.Context())
 		conn := &lobby.LobbyConnection{
-			UserID:  userID,
+			UserID:  userUUID,
 			Cancel:  cancel,
 			OutChan: make(chan map[string]interface{}, 10),
 		}
-		ls.Connections[userID] = conn
-		ls.ReadyStates[userID] = false // by default, user is not ready
-		logger.Infof("User %v connected to lobby %v", userID, lobbyUUID)
+		ls.Connections[userUUID] = conn
+		ls.ReadyStates[userUUID] = false // default not ready
 
-		// Start a goroutine to write messages from OutChan to the websocket
+		logger.Infof("User %v connected to lobby %v", userUUID, lobbyUUID)
+
 		go writePump(ctx, c, conn, logger)
 
-		// Broadcast that a new user joined
-		ls.BroadcastJoin(userID)
-
-		// read loop
-		readPump(ctx, c, ls, conn, logger)
+		ls.BroadcastJoin(userUUID)
+		readPump(ctx, c, ls, conn, logger, lobbyUUID)
 	}
 }
 
 // readPump reads messages from the websocket until disconnect. We handle JSON commands here.
-func readPump(ctx context.Context, c *websocket.Conn, ls *lobby.LobbyState, conn *lobby.LobbyConnection, logger *logrus.Logger) {
+func readPump(ctx context.Context, c *websocket.Conn, ls *lobby.LobbyState, conn *lobby.LobbyConnection, logger *logrus.Logger, lobbyID uuid.UUID) {
 	defer func() {
-		// on exit
 		ls.RemoveUser(conn.UserID)
 		conn.Cancel()
 		c.Close(websocket.StatusNormalClosure, "closing")
@@ -135,41 +132,87 @@ func readPump(ctx context.Context, c *websocket.Conn, ls *lobby.LobbyState, conn
 			continue
 		}
 
-		handleLobbyMessage(packet, ls, conn, logger)
+		handleLobbyMessage(packet, ls, conn, logger, lobbyID)
 	}
 }
 
 // handleLobbyMessage interprets the "type" field received by client and updates the lobby or broadcasts accordingly.
-func handleLobbyMessage(packet map[string]interface{}, ls *lobby.LobbyState, conn *lobby.LobbyConnection, logger *logrus.Logger) {
+func handleLobbyMessage(packet map[string]interface{}, ls *lobby.LobbyState, conn *lobby.LobbyConnection, logger *logrus.Logger, lobbyID uuid.UUID) {
 	action, _ := packet["type"].(string)
 	switch action {
 	case "ready":
-		ls.ReadyStates[conn.UserID] = true
-		ls.BroadcastReadyState(conn.UserID, true)
-		// If autoStart is on and everyone is ready, start countdown
+		// verify user is connected to the game server
+		if !isUserConnectedToGame(lobbyID, conn.UserID) {
+			conn.OutChan <- map[string]interface{}{
+				"type":    "error",
+				"message": "You must connect to the game server WebSocket before readying",
+			}
+			return
+		}
+		ls.MarkUserReady(conn.UserID)
 		if ls.AutoStart && ls.AreAllReady() {
 			ls.StartCountdown(10)
 		}
 	case "unready":
-		ls.ReadyStates[conn.UserID] = false
-		ls.BroadcastReadyState(conn.UserID, false)
-		// Cancel countdown if any
-		ls.CancelCountdown()
+		ls.MarkUserUnready(conn.UserID)
 	case "leave_lobby":
-		// remove from DB's lobby_participants
-		err := database.RemoveUserFromLobby(context.Background(), conn.UserID, ls.LobbyID)
+		err := database.RemoveUserFromLobby(context.Background(), conn.UserID, lobbyID)
 		if err != nil {
 			logger.Warnf("failed to remove user %v from DB: %v", conn.UserID, err)
 		}
 		ls.BroadcastLeave(conn.UserID)
-		// we can close the socket
 		conn.Cancel()
 	case "chat":
 		msg, _ := packet["msg"].(string)
 		ls.BroadcastChat(conn.UserID, msg)
+	case "start_game":
+		// host wants to forcibly start
+		// check all players are ready & connected, if so "start" the game
+		if !ls.AreAllReady() {
+			conn.OutChan <- map[string]interface{}{
+				"type":    "error",
+				"message": "Not all players are ready",
+			}
+			return
+		}
+		if !allUsersConnectedToGame(lobbyID, ls) {
+			conn.OutChan <- map[string]interface{}{
+				"type":    "error",
+				"message": "Some players not connected to the game server",
+			}
+			return
+		}
+		ls.CancelCountdown()
+		ls.BroadcastAll(map[string]interface{}{
+			"type": "game_started",
+		})
 	default:
 		logger.Warnf("unknown action %s from user %v", action, conn.UserID)
 	}
+}
+
+func isUserConnectedToGame(lobbyID, userID uuid.UUID) bool {
+	// We find the game that was created for this lobby (we assume same ID or a mapping).
+	g := gameSrvForLobbyWS.GameStore.GetGameByLobbyID(lobbyID)
+	if g == nil {
+		return false
+	}
+	for _, p := range g.Players {
+		if p.ID == userID && p.Connected {
+			return true
+		}
+	}
+	return false
+}
+
+// allUsersConnectedToGame checks if all players in the lobby are connected to the game.
+func allUsersConnectedToGame(lobbyID uuid.UUID, ls *lobby.LobbyState) bool {
+	for uid := range ls.ReadyStates {
+		if !isUserConnectedToGame(lobbyID, uid) {
+			return false
+		}
+	}
+	return true
 }
 
 // writePump writes messages from conn.OutChan to the websocket until context is canceled.

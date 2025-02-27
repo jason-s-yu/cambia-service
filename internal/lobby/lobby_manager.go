@@ -65,22 +65,22 @@ func (lm *LobbyManager) RemoveLobbyState(lobbyID uuid.UUID) {
 }
 
 // StartCountdown initiates a countdown if AutoStart is true and all players are ready.
+// It also broadcasts a "countdown_started" message to clients.
 func (ls *LobbyState) StartCountdown(seconds int) {
 	if ls.CountdownTimer != nil {
 		// already counting down
 		return
 	}
-	ls.CountdownTimer = time.AfterFunc(time.Duration(seconds)*time.Second, func() {
-		ls.broadcast(map[string]interface{}{
-			"type": "countdown_finished",
-			"msg":  "All players ready, starting now...",
-		})
-		// TODO: game transition
-	})
-	ls.broadcast(map[string]interface{}{
+	ls.BroadcastAll(map[string]interface{}{
 		"type":       "countdown_started",
 		"seconds":    seconds,
 		"auto_start": true,
+	})
+	ls.CountdownTimer = time.AfterFunc(time.Duration(seconds)*time.Second, func() {
+		ls.BroadcastAll(map[string]interface{}{
+			"type": "countdown_finished",
+			"msg":  "All players ready, starting now...",
+		})
 	})
 }
 
@@ -89,14 +89,39 @@ func (ls *LobbyState) CancelCountdown() {
 	if ls.CountdownTimer != nil {
 		ls.CountdownTimer.Stop()
 		ls.CountdownTimer = nil
-		ls.broadcast(map[string]interface{}{
-			"type": "countdown_canceled",
+		ls.BroadcastAll(map[string]interface{}{
+			"type": "countdown_interrupted",
 		})
 	}
 }
 
-// broadcast sends a JSON object to all connected users' OutChan.
-func (ls *LobbyState) broadcast(msg map[string]interface{}) {
+// MarkUserReady checks if the user is connected and sets their ready state.
+func (ls *LobbyState) MarkUserReady(userID uuid.UUID) {
+	if _, ok := ls.Connections[userID]; !ok {
+		// user not truly connected
+		return
+	}
+	ls.ReadyStates[userID] = true
+	ls.BroadcastReadyState(userID, true)
+}
+
+// MarkUserUnready unsets a user's ready state, then cancels the countdown if any.
+func (ls *LobbyState) MarkUserUnready(userID uuid.UUID) {
+	if _, ok := ls.Connections[userID]; !ok {
+		// user not truly connected
+		return
+	}
+	ls.ReadyStates[userID] = false
+	ls.BroadcastReadyState(userID, false)
+	ls.CancelCountdown()
+}
+
+func (ls *LobbyState) BroadcastCustom(msg map[string]interface{}) {
+	ls.BroadcastAll(msg)
+}
+
+// BroadcastAll sends a JSON object to all connected users' OutChan.
+func (ls *LobbyState) BroadcastAll(msg map[string]interface{}) {
 	for _, conn := range ls.Connections {
 		conn.OutChan <- msg
 	}
@@ -117,7 +142,7 @@ func (ls *LobbyState) AreAllReady() bool {
 
 // BroadcastJoin sends a "lobby_update" message indicating a user joined.
 func (ls *LobbyState) BroadcastJoin(userID uuid.UUID) {
-	ls.broadcast(map[string]interface{}{
+	ls.BroadcastAll(map[string]interface{}{
 		"type":      "lobby_update",
 		"user_join": userID.String(),
 		"ready_map": ls.ReadyStates, // pass the full readiness map if desired
@@ -126,7 +151,7 @@ func (ls *LobbyState) BroadcastJoin(userID uuid.UUID) {
 
 // BroadcastReadyState sends an update that a particular user changed their ready state.
 func (ls *LobbyState) BroadcastReadyState(userID uuid.UUID, ready bool) {
-	ls.broadcast(map[string]interface{}{
+	ls.BroadcastAll(map[string]interface{}{
 		"type":     "ready_update",
 		"user_id":  userID.String(),
 		"is_ready": ready,
@@ -135,7 +160,7 @@ func (ls *LobbyState) BroadcastReadyState(userID uuid.UUID, ready bool) {
 
 // BroadcastLeave sends a "lobby_update" message indicating a user left.
 func (ls *LobbyState) BroadcastLeave(userID uuid.UUID) {
-	ls.broadcast(map[string]interface{}{
+	ls.BroadcastAll(map[string]interface{}{
 		"type":      "lobby_update",
 		"user_left": userID.String(),
 		"ready_map": ls.ReadyStates,
@@ -144,7 +169,7 @@ func (ls *LobbyState) BroadcastLeave(userID uuid.UUID) {
 
 // BroadcastChat sends a chat message from a given user.
 func (ls *LobbyState) BroadcastChat(userID uuid.UUID, msg string) {
-	ls.broadcast(map[string]interface{}{
+	ls.BroadcastAll(map[string]interface{}{
 		"type":    "chat",
 		"user_id": userID.String(),
 		"msg":     msg,
@@ -157,7 +182,7 @@ func (ls *LobbyState) BroadcastChat(userID uuid.UUID, msg string) {
 func (ls *LobbyState) RemoveUser(userID uuid.UUID) {
 	delete(ls.Connections, userID)
 	delete(ls.ReadyStates, userID)
-	ls.broadcast(map[string]interface{}{
+	ls.BroadcastAll(map[string]interface{}{
 		"type":      "lobby_update",
 		"user_left": userID.String(),
 		"ready_map": ls.ReadyStates,

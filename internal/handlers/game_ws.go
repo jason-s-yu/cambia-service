@@ -81,9 +81,7 @@ func GameWSHandler(logger *logrus.Logger, gs *GameServer) http.HandlerFunc {
 		defer cancel()
 
 		// read loop
-		go readGameMessages(ctx, g, p, logger)
-
-		// TODO: writePump to push events to the client, but for now we might do direct writes in readGameMessages if needed.
+		readGameMessages(ctx, g, p, logger)
 	}
 }
 

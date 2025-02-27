@@ -12,12 +12,15 @@ import (
 	"github.com/jason-s-yu/cambia/internal/models"
 )
 
+// OnGameEndFunc is a function signature that can handle a finished game, broadcasting results to the lobby, etc.
+type OnGameEndFunc func(lobbyID uuid.UUID, winner uuid.UUID, scores map[uuid.UUID]int)
+
 // CambiaGame holds the entire state for a single game instance in memory.
-// We'll store all real-time data here and persist final results at game end.
 type CambiaGame struct {
 	ID      uuid.UUID
-	Players []*models.Player
+	LobbyID uuid.UUID // references the lobby that spawned this game
 
+	Players     []*models.Player
 	Deck        []*models.Card
 	DiscardPile []*models.Card
 
@@ -27,14 +30,31 @@ type CambiaGame struct {
 	Started            bool
 	GameOver           bool
 
-	// lastSeen tracks last known activity for each player to handle DC
 	lastSeen map[uuid.UUID]time.Time
 
-	// turnTimer manages turn timeouts
 	turnTimer    *time.Timer
 	turnDuration time.Duration
 
+	OnGameEnd OnGameEndFunc // optional callback for broadcasting results to the lobby
+
 	mu sync.Mutex
+}
+
+// NewCambiaGame builds an empty instance with a newly shuffled deck.
+func NewCambiaGame() *CambiaGame {
+	id, _ := uuid.NewRandom()
+	g := &CambiaGame{
+		ID:                 id,
+		Deck:               []*models.Card{},
+		DiscardPile:        []*models.Card{},
+		lastSeen:           make(map[uuid.UUID]time.Time),
+		CurrentPlayerIndex: 0,
+		Started:            false,
+		GameOver:           false,
+		turnDuration:       15 * time.Second,
+	}
+	g.initializeDeck()
+	return g
 }
 
 // AddPlayer merges the logic from old AddPlayer. If the player already exists, update the conn.
@@ -52,23 +72,6 @@ func (g *CambiaGame) AddPlayer(p *models.Player) {
 	}
 	g.Players = append(g.Players, p)
 	g.lastSeen[p.ID] = time.Now()
-}
-
-// NewCambiaGame builds an empty instance with a newly shuffled deck.
-func NewCambiaGame() *CambiaGame {
-	id, _ := uuid.NewRandom()
-	g := &CambiaGame{
-		ID:                 id,
-		Deck:               []*models.Card{},
-		DiscardPile:        []*models.Card{},
-		lastSeen:           make(map[uuid.UUID]time.Time),
-		CurrentPlayerIndex: 0,
-		Started:            false,
-		GameOver:           false,
-		turnDuration:       15 * time.Second, // default
-	}
-	g.initializeDeck()
-	return g
 }
 
 // initializeDeck sets up a standard Cambia deck, including jokers, red kings = -1, etc.
@@ -111,7 +114,6 @@ func (g *CambiaGame) initializeDeck() {
 		})
 	}
 
-	rand.Seed(time.Now().UnixNano())
 	rand.Shuffle(len(deck), func(i, j int) {
 		deck[i], deck[j] = deck[j], deck[i]
 	})
@@ -438,21 +440,26 @@ func (g *CambiaGame) handleCallCambia(playerID uuid.UUID) {
 	g.advanceTurn()
 }
 
-// EndGame finalizes scoring and sets GameOver. We then persist to DB, handle rating updates, etc.
+// EndGame finalizes scoring, sets GameOver, and calls OnGameEnd if present.
 func (g *CambiaGame) EndGame() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
 	if g.GameOver {
 		return
 	}
 	g.GameOver = true
 	log.Printf("Ending game %v, computing final scores...", g.ID)
 
-	// compute final scores
 	finalScores := g.computeScores()
-	// find winner(s)
 	winners := findWinners(finalScores)
-
-	// Persist results
-	go g.persistResults(finalScores, winners) // do async
+	var firstWinner uuid.UUID
+	if len(winners) > 0 {
+		firstWinner = winners[0]
+	}
+	if g.OnGameEnd != nil {
+		g.OnGameEnd(g.LobbyID, firstWinner, finalScores)
+	}
 }
 
 // computeScores calculates each player's sum of hand

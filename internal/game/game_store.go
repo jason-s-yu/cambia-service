@@ -40,6 +40,19 @@ func (s *GameStore) DeleteGame(id uuid.UUID) {
 	delete(s.games, id)
 }
 
+// GetGameByLobbyID returns a game that references a given lobby ID, or nil if none is found
+// This requires that each CambiaGame store a LobbyID.
+func (store *GameStore) GetGameByLobbyID(lobbyID uuid.UUID) *CambiaGame {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for _, g := range store.games {
+		if g.LobbyID == lobbyID {
+			return g
+		}
+	}
+	return nil
+}
+
 // NewCambiaGameFromLobby creates the in-memory game from the lobby participants, copying house rules, etc.
 func (s *GameStore) NewCambiaGameFromLobby(lobby *models.Lobby, ctx context.Context) *CambiaGame {
 	s.mu.Lock()
