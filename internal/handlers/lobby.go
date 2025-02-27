@@ -94,14 +94,18 @@ func CreateLobbyHandler(w http.ResponseWriter, r *http.Request) {
 		Ranked      bool   `json:"ranked"`
 		RankingMode string `json:"ranking_mode"`
 
-		Rules struct {
+		HouseRules struct {
 			DisconnectionThreshold        int  `json:"disconnection_threshold"`
 			HouseRuleFreezeDisconnect     bool `json:"house_rule_freeze_disconnect"`
 			HouseRuleForfeitDisconnect    bool `json:"house_rule_forfeit_disconnect"`
 			HouseRuleMissedRoundThreshold int  `json:"house_rule_missed_round_threshold"`
 			PenaltyCardCount              int  `json:"penalty_card_count"`
 			AllowReplacedDiscardAbilities bool `json:"allow_replaced_discard_abilities"`
-		} `json:"rules"`
+
+			// newly recognized
+			AutoStart      bool `json:"auto_start"`
+			TurnTimeoutSec int  `json:"turn_timeout_sec"`
+		} `json:"house_rules"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -115,20 +119,22 @@ func CreateLobbyHandler(w http.ResponseWriter, r *http.Request) {
 
 	lobbyID := uuid.Must(uuid.NewRandom())
 	lobby := models.Lobby{
-		ID:         lobbyID,
-		HostUserID: userID,
-		Type:       req.Type,
-
+		ID:          lobbyID,
+		HostUserID:  userID,
+		Type:        req.Type,
 		CircuitMode: req.CircuitMode,
 		Ranked:      req.Ranked,
 		RankingMode: req.RankingMode,
-
-		DisconnectionThreshold:        req.Rules.DisconnectionThreshold,
-		HouseRuleFreezeDisconnect:     req.Rules.HouseRuleFreezeDisconnect,
-		HouseRuleForfeitDisconnect:    req.Rules.HouseRuleForfeitDisconnect,
-		HouseRuleMissedRoundThreshold: req.Rules.HouseRuleMissedRoundThreshold,
-		PenaltyCardCount:              req.Rules.PenaltyCardCount,
-		AllowReplacedDiscardAbilities: req.Rules.AllowReplacedDiscardAbilities,
+		HouseRules: models.HouseRules{
+			DisconnectionRoundLimit: req.HouseRules.DisconnectionThreshold,
+			FreezeOnDisconnect:      req.HouseRules.HouseRuleFreezeDisconnect,
+			ForfeitOnDisconnect:     req.HouseRules.HouseRuleForfeitDisconnect,
+			MissedRoundThreshold:    req.HouseRules.HouseRuleMissedRoundThreshold,
+			PenaltyCardCount:        req.HouseRules.PenaltyCardCount,
+			AllowDiscardAbilities:   req.HouseRules.AllowReplacedDiscardAbilities,
+			AutoStart:               req.HouseRules.AutoStart,
+			TurnTimeoutSec:          req.HouseRules.TurnTimeoutSec,
+		},
 	}
 
 	ctx := r.Context()
@@ -150,13 +156,15 @@ func CreateLobbyHandler(w http.ResponseWriter, r *http.Request) {
 		"circuit_mode": lobby.CircuitMode,
 		"ranked":       lobby.Ranked,
 		"ranking_mode": lobby.RankingMode,
-		"rules": map[string]interface{}{
-			"disconnection_threshold":           lobby.DisconnectionThreshold,
-			"house_rule_freeze_disconnect":      lobby.HouseRuleFreezeDisconnect,
-			"house_rule_forfeit_disconnect":     lobby.HouseRuleForfeitDisconnect,
-			"house_rule_missed_round_threshold": lobby.HouseRuleMissedRoundThreshold,
-			"penalty_card_count":                lobby.PenaltyCardCount,
-			"allow_replaced_discard_abilities":  lobby.AllowReplacedDiscardAbilities,
+		"house_rules": map[string]interface{}{
+			"disconnection_threshold":           lobby.HouseRules.DisconnectionRoundLimit,
+			"house_rule_freeze_disconnect":      lobby.HouseRules.FreezeOnDisconnect,
+			"house_rule_forfeit_disconnect":     lobby.HouseRules.ForfeitOnDisconnect,
+			"house_rule_missed_round_threshold": lobby.HouseRules.MissedRoundThreshold,
+			"penalty_card_count":                lobby.HouseRules.PenaltyCardCount,
+			"allow_replaced_discard_abilities":  lobby.HouseRules.AllowDiscardAbilities,
+			"auto_start":                        lobby.HouseRules.AutoStart,
+			"turn_timeout_sec":                  lobby.HouseRules.TurnTimeoutSec,
 		},
 	}
 
@@ -299,48 +307,35 @@ func ListLobbiesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type lobbyResp struct {
-		ID         string `json:"id"`
-		HostUserID string `json:"host_user_id"`
-		Type       string `json:"type"`
-
-		CircuitMode bool   `json:"circuit_mode"`
-		Ranked      bool   `json:"ranked"`
-		RankingMode string `json:"ranking_mode"`
-
-		DisconnectionThreshold        int  `json:"disconnection_threshold"`
-		HouseRuleFreezeDisconnect     bool `json:"house_rule_freeze_disconnect"`
-		HouseRuleForfeitDisconnect    bool `json:"house_rule_forfeit_disconnect"`
-		HouseRuleMissedRoundThreshold int  `json:"house_rule_missed_round_threshold"`
-		PenaltyCardCount              int  `json:"penalty_card_count"`
-		AllowReplacedDiscardAbilities bool `json:"allow_replaced_discard_abilities"`
-
-		Rules map[string]interface{} `json:"rules"`
+		ID          string                 `json:"id"`
+		HostUserID  string                 `json:"host_user_id"`
+		Type        string                 `json:"type"`
+		CircuitMode bool                   `json:"circuit_mode"`
+		Ranked      bool                   `json:"ranked"`
+		RankingMode string                 `json:"ranking_mode"`
+		HouseRules  map[string]interface{} `json:"house_rules"`
 	}
 
 	var resp []lobbyResp
 	for _, l := range lobbies {
 		rmap := map[string]interface{}{
-			"disconnection_threshold":           l.DisconnectionThreshold,
-			"house_rule_freeze_disconnect":      l.HouseRuleFreezeDisconnect,
-			"house_rule_forfeit_disconnect":     l.HouseRuleForfeitDisconnect,
-			"house_rule_missed_round_threshold": l.HouseRuleMissedRoundThreshold,
-			"penalty_card_count":                l.PenaltyCardCount,
-			"allow_replaced_discard_abilities":  l.AllowReplacedDiscardAbilities,
+			"disconnection_threshold":           l.HouseRules.DisconnectionRoundLimit,
+			"house_rule_freeze_disconnect":      l.HouseRules.FreezeOnDisconnect,
+			"house_rule_forfeit_disconnect":     l.HouseRules.ForfeitOnDisconnect,
+			"house_rule_missed_round_threshold": l.HouseRules.MissedRoundThreshold,
+			"penalty_card_count":                l.HouseRules.PenaltyCardCount,
+			"allow_replaced_discard_abilities":  l.HouseRules.AllowDiscardAbilities,
+			"auto_start":                        l.HouseRules.AutoStart,
+			"turn_timeout_sec":                  l.HouseRules.TurnTimeoutSec,
 		}
 		resp = append(resp, lobbyResp{
-			ID:                            l.ID.String(),
-			HostUserID:                    l.HostUserID.String(),
-			Type:                          l.Type,
-			CircuitMode:                   l.CircuitMode,
-			Ranked:                        l.Ranked,
-			RankingMode:                   l.RankingMode,
-			DisconnectionThreshold:        l.DisconnectionThreshold,
-			HouseRuleFreezeDisconnect:     l.HouseRuleFreezeDisconnect,
-			HouseRuleForfeitDisconnect:    l.HouseRuleForfeitDisconnect,
-			HouseRuleMissedRoundThreshold: l.HouseRuleMissedRoundThreshold,
-			PenaltyCardCount:              l.PenaltyCardCount,
-			AllowReplacedDiscardAbilities: l.AllowReplacedDiscardAbilities,
-			Rules:                         rmap,
+			ID:          l.ID.String(),
+			HostUserID:  l.HostUserID.String(),
+			Type:        l.Type,
+			CircuitMode: l.CircuitMode,
+			Ranked:      l.Ranked,
+			RankingMode: l.RankingMode,
+			HouseRules:  rmap,
 		})
 	}
 

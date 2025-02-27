@@ -143,7 +143,7 @@ func handleLobbyMessage(packet map[string]interface{}, ls *lobby.LobbyState, con
 	switch action {
 	case "ready":
 		ls.MarkUserReady(conn.UserID)
-		if ls.AutoStart && ls.AreAllReady() {
+		if ls.Rules.AutoStart && ls.AreAllReady() {
 			ls.StartCountdown(10)
 		}
 	case "unready":

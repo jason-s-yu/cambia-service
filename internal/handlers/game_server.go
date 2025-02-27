@@ -37,13 +37,18 @@ func (gs *GameServer) NewCambiaGameFromLobby(ctx context.Context, lobby *models.
 	g := game.NewCambiaGame()
 	g.LobbyID = lobby.ID
 
-	g.HouseRules.FreezeOnDisconnect = lobby.HouseRuleFreezeDisconnect
-	g.HouseRules.ForfeitOnDisconnect = lobby.HouseRuleForfeitDisconnect
-	g.HouseRules.MissedRoundThreshold = lobby.HouseRuleMissedRoundThreshold
-	g.HouseRules.PenaltyCardCount = lobby.PenaltyCardCount
-	g.HouseRules.AllowDiscardAbilities = lobby.AllowReplacedDiscardAbilities
-	g.HouseRules.DisconnectionRoundLimit = lobby.DisconnectionThreshold
-	g.HouseRules.TurnTimeoutSec = 15 // default
+	houseRules := models.HouseRules{
+		FreezeOnDisconnect:      lobby.HouseRules.FreezeOnDisconnect,
+		ForfeitOnDisconnect:     lobby.HouseRules.ForfeitOnDisconnect,
+		MissedRoundThreshold:    lobby.HouseRules.MissedRoundThreshold,
+		PenaltyCardCount:        lobby.HouseRules.PenaltyCardCount,
+		AllowDiscardAbilities:   lobby.HouseRules.AllowDiscardAbilities,
+		DisconnectionRoundLimit: lobby.HouseRules.DisconnectionRoundLimit,
+		TurnTimeoutSec:          lobby.HouseRules.TurnTimeoutSec,
+		AutoStart:               lobby.HouseRules.AutoStart,
+	}
+
+	g.HouseRules = houseRules
 
 	participants, err := fetchLobbyParticipants(ctx, lobby.ID)
 	if err != nil {

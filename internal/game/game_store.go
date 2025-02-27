@@ -1,13 +1,9 @@
 package game
 
 import (
-	"context"
-	"log"
 	"sync"
-	"time"
 
 	"github.com/google/uuid"
-	"github.com/jason-s-yu/cambia/internal/models"
 )
 
 type GameStore struct {
@@ -51,35 +47,4 @@ func (store *GameStore) GetGameByLobbyID(lobbyID uuid.UUID) *CambiaGame {
 		}
 	}
 	return nil
-}
-
-// NewCambiaGameFromLobby creates the in-memory game from the lobby participants, copying house rules, etc.
-func (s *GameStore) NewCambiaGameFromLobby(lobby *models.Lobby, ctx context.Context) *CambiaGame {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	g := NewCambiaGame()
-	g.HouseRules = models.HouseRules{
-		FreezeOnDisconnect:      lobby.HouseRuleFreezeDisconnect,
-		ForfeitOnDisconnect:     lobby.HouseRuleForfeitDisconnect,
-		MissedRoundThreshold:    lobby.HouseRuleMissedRoundThreshold,
-		PenaltyCardCount:        lobby.PenaltyCardCount,
-		AllowDiscardAbilities:   lobby.AllowReplacedDiscardAbilities,
-		DisconnectionRoundLimit: lobby.DisconnectionThreshold,
-	}
-
-	// TODO: mode based turn timer, for now we rely on HouseRules
-	players, err := fetchParticipants(ctx, lobby.ID)
-	if err != nil {
-		log.Printf("NewCambiaGameFromLobby error: %v", err)
-	} else {
-		g.Players = players
-		for _, p := range players {
-			g.lastSeen[p.ID] = time.Now()
-		}
-	}
-
-	s.games[g.ID] = g
-	g.Start()
-	return g
 }

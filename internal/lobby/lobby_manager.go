@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jason-s-yu/cambia/internal/models"
 )
 
 // LobbyManager manages all active lobbies in memory. Each lobby is tracked
@@ -17,13 +18,17 @@ type LobbyManager struct {
 	lobbies map[uuid.UUID]*LobbyState
 }
 
-// LobbyState represents the in-memory state for a single lobby's real-time connections.
+// LobbyState represents the in-memory state for a single lobby's real-time connections
+// plus a local copy of HouseRules for auto_start, turn_timeout, etc.
 type LobbyState struct {
-	LobbyID        uuid.UUID
-	Connections    map[uuid.UUID]*LobbyConnection // userID -> connection
-	ReadyStates    map[uuid.UUID]bool             // is each user ready?
-	AutoStart      bool                           // if true, starts a countdown when all are ready
-	CountdownTimer *time.Timer                    // reference to active countdown timer, if any
+	LobbyID     uuid.UUID
+	Connections map[uuid.UUID]*LobbyConnection
+	ReadyStates map[uuid.UUID]bool
+
+	// We store an in-memory copy of HouseRules. The server can override them from "rule_update".
+	Rules models.HouseRules
+
+	CountdownTimer *time.Timer
 }
 
 // LobbyConnection wraps a single user's active WebSocket connection for the lobby.
@@ -50,7 +55,10 @@ func (lm *LobbyManager) GetOrCreateLobbyState(lobbyID uuid.UUID) *LobbyState {
 			LobbyID:     lobbyID,
 			Connections: make(map[uuid.UUID]*LobbyConnection),
 			ReadyStates: make(map[uuid.UUID]bool),
-			AutoStart:   true, // default to auto-start
+			Rules: models.HouseRules{
+				AutoStart:      true,
+				TurnTimeoutSec: 15,
+			},
 		}
 		lm.lobbies[lobbyID] = ls
 	}
@@ -68,13 +76,13 @@ func (lm *LobbyManager) RemoveLobbyState(lobbyID uuid.UUID) {
 // It also broadcasts a "countdown_started" message to clients.
 func (ls *LobbyState) StartCountdown(seconds int) {
 	if ls.CountdownTimer != nil {
-		// disregard this call if we're already counting down
 		return
 	}
 	ls.BroadcastAll(map[string]interface{}{
-		"type":       "countdown_started",
-		"seconds":    seconds,
-		"auto_start": true,
+		"type":         "countdown_started",
+		"seconds":      seconds,
+		"auto_start":   ls.Rules.AutoStart,
+		"turn_timeout": ls.Rules.TurnTimeoutSec,
 	})
 	ls.CountdownTimer = time.AfterFunc(time.Duration(seconds)*time.Second, func() {
 		ls.BroadcastAll(map[string]interface{}{
@@ -98,11 +106,15 @@ func (ls *LobbyState) CancelCountdown() {
 // UpdateRules updates local memory rules. For now we only handle "auto_start".
 func (ls *LobbyState) UpdateRules(newRules map[string]interface{}) {
 	if as, ok := newRules["auto_start"].(bool); ok {
-		ls.AutoStart = as
+		ls.Rules.AutoStart = as
+	}
+	if tts, ok := newRules["turn_timeout_sec"].(float64); ok {
+		ls.Rules.TurnTimeoutSec = int(tts)
 	}
 	ls.BroadcastAll(map[string]interface{}{
-		"type":      "rule_update_ack",
-		"autoStart": ls.AutoStart,
+		"type":             "rule_update_ack",
+		"auto_start":       ls.Rules.AutoStart,
+		"turn_timeout_sec": ls.Rules.TurnTimeoutSec,
 	})
 }
 

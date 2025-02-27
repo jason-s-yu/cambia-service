@@ -16,14 +16,21 @@ func InsertLobby(ctx context.Context, lobby *models.Lobby) error {
 	q := `
 	INSERT INTO lobbies (
 		id, host_user_id, type, circuit_mode,
-		ranked, ranking_mode, disconnection_threshold,
+		ranked, ranking_mode,
 		house_rule_freeze_disconnect,
 		house_rule_forfeit_disconnect,
 		house_rule_missed_round_threshold,
 		penalty_card_count,
-		allow_replaced_discard_abilities
+		allow_replaced_discard_abilities,
+		disconnection_threshold,
+		turn_timeout_sec,
+		auto_start
 	)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+	VALUES ($1, $2, $3, $4,
+	        $5, $6,
+	        $7, $8, $9,
+	        $10, $11,
+	        $12, $13, $14)
 	`
 	return pgx.BeginTxFunc(ctx, DB, pgx.TxOptions{}, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, q,
@@ -33,12 +40,14 @@ func InsertLobby(ctx context.Context, lobby *models.Lobby) error {
 			lobby.CircuitMode,
 			lobby.Ranked,
 			lobby.RankingMode,
-			lobby.DisconnectionThreshold,
-			lobby.HouseRuleFreezeDisconnect,
-			lobby.HouseRuleForfeitDisconnect,
-			lobby.HouseRuleMissedRoundThreshold,
-			lobby.PenaltyCardCount,
-			lobby.AllowReplacedDiscardAbilities,
+			lobby.HouseRules.FreezeOnDisconnect,
+			lobby.HouseRules.ForfeitOnDisconnect,
+			lobby.HouseRules.MissedRoundThreshold,
+			lobby.HouseRules.PenaltyCardCount,
+			lobby.HouseRules.AllowDiscardAbilities,
+			lobby.HouseRules.DisconnectionRoundLimit,
+			lobby.HouseRules.TurnTimeoutSec,
+			lobby.HouseRules.AutoStart,
 		)
 		return err
 	})
@@ -50,12 +59,15 @@ func GetLobby(ctx context.Context, lobbyID uuid.UUID) (*models.Lobby, error) {
 	q := `
 	SELECT 
 		id, host_user_id, type, circuit_mode,
-		ranked, ranking_mode, disconnection_threshold,
+		ranked, ranking_mode,
 		house_rule_freeze_disconnect,
 		house_rule_forfeit_disconnect,
 		house_rule_missed_round_threshold,
 		penalty_card_count,
-		allow_replaced_discard_abilities
+		allow_replaced_discard_abilities,
+		disconnection_threshold,
+		turn_timeout_sec,
+		auto_start
 	FROM lobbies
 	WHERE id = $1
 	`
@@ -66,12 +78,14 @@ func GetLobby(ctx context.Context, lobbyID uuid.UUID) (*models.Lobby, error) {
 		&l.CircuitMode,
 		&l.Ranked,
 		&l.RankingMode,
-		&l.DisconnectionThreshold,
-		&l.HouseRuleFreezeDisconnect,
-		&l.HouseRuleForfeitDisconnect,
-		&l.HouseRuleMissedRoundThreshold,
-		&l.PenaltyCardCount,
-		&l.AllowReplacedDiscardAbilities,
+		&l.HouseRules.FreezeOnDisconnect,
+		&l.HouseRules.ForfeitOnDisconnect,
+		&l.HouseRules.MissedRoundThreshold,
+		&l.HouseRules.PenaltyCardCount,
+		&l.HouseRules.AllowDiscardAbilities,
+		&l.HouseRules.DisconnectionRoundLimit,
+		&l.HouseRules.TurnTimeoutSec,
+		&l.HouseRules.AutoStart,
 	)
 	if err != nil {
 		return nil, err
@@ -130,12 +144,15 @@ func GetAllLobbies(ctx context.Context) ([]models.Lobby, error) {
 	q := `
 		SELECT 
 			id, host_user_id, type, circuit_mode,
-			ranked, ranking_mode, disconnection_threshold,
+			ranked, ranking_mode,
 			house_rule_freeze_disconnect,
 			house_rule_forfeit_disconnect,
 			house_rule_missed_round_threshold,
 			penalty_card_count,
-			allow_replaced_discard_abilities
+			allow_replaced_discard_abilities,
+			disconnection_threshold,
+			turn_timeout_sec,
+			auto_start
 		FROM lobbies
 	`
 	rows, err := DB.Query(ctx, q)
@@ -154,12 +171,14 @@ func GetAllLobbies(ctx context.Context) ([]models.Lobby, error) {
 			&l.CircuitMode,
 			&l.Ranked,
 			&l.RankingMode,
-			&l.DisconnectionThreshold,
-			&l.HouseRuleFreezeDisconnect,
-			&l.HouseRuleForfeitDisconnect,
-			&l.HouseRuleMissedRoundThreshold,
-			&l.PenaltyCardCount,
-			&l.AllowReplacedDiscardAbilities,
+			&l.HouseRules.FreezeOnDisconnect,
+			&l.HouseRules.ForfeitOnDisconnect,
+			&l.HouseRules.MissedRoundThreshold,
+			&l.HouseRules.PenaltyCardCount,
+			&l.HouseRules.AllowDiscardAbilities,
+			&l.HouseRules.DisconnectionRoundLimit,
+			&l.HouseRules.TurnTimeoutSec,
+			&l.HouseRules.AutoStart,
 		)
 		if err != nil {
 			return nil, err
