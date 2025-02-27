@@ -1,5 +1,4 @@
 // internal/lobby/lobby_manager.go
-
 package lobby
 
 import (
@@ -11,6 +10,13 @@ import (
 	"github.com/jason-s-yu/cambia/internal/models"
 )
 
+// OnLobbyCountdownFinishFunc defines the signature of a callback function
+// that is invoked when the countdown finishes in a LobbyState.
+//
+// It passes the lobby's UUID so the callback can perform game creation or
+// other logic without a circular import of the handlers or game packages.
+type OnLobbyCountdownFinishFunc func(lobbyID uuid.UUID)
+
 // LobbyManager manages all active lobbies in memory. Each lobby is tracked
 // by a LobbyState, keyed by the lobby's UUID.
 type LobbyManager struct {
@@ -21,12 +27,19 @@ type LobbyManager struct {
 // LobbyState represents the in-memory state for a single lobby's real-time connections
 // plus a local copy of HouseRules for auto_start, turn_timeout, etc.
 type LobbyState struct {
-	LobbyID     uuid.UUID
+	LobbyID uuid.UUID
+
 	Connections map[uuid.UUID]*LobbyConnection
 	ReadyStates map[uuid.UUID]bool
 
 	// We store an in-memory copy of HouseRules. The server can override them from "rule_update".
 	Rules models.HouseRules
+
+	// InGame indicates whether a game is currently active. If so, we might block further starts.
+	InGame bool
+
+	// OnCountdownFinish is the callback that is invoked when the countdown ends.
+	OnCountdownFinish OnLobbyCountdownFinishFunc
 
 	CountdownTimer *time.Timer
 }
@@ -34,7 +47,7 @@ type LobbyState struct {
 // LobbyConnection wraps a single user's active WebSocket connection for the lobby.
 type LobbyConnection struct {
 	UserID  uuid.UUID
-	Cancel  context.CancelFunc // used to kill the read loop if needed
+	Cancel  context.CancelFunc
 	OutChan chan map[string]interface{}
 }
 
@@ -46,6 +59,9 @@ func NewLobbyManager() *LobbyManager {
 }
 
 // GetOrCreateLobbyState returns the LobbyState for the given lobbyID, creating if not present.
+//
+// This method sets default HouseRules if a new state is created, but OnCountdownFinish
+// remains nil until you set it, if you want automatic game creation.
 func (lm *LobbyManager) GetOrCreateLobbyState(lobbyID uuid.UUID) *LobbyState {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
@@ -59,6 +75,7 @@ func (lm *LobbyManager) GetOrCreateLobbyState(lobbyID uuid.UUID) *LobbyState {
 				AutoStart:      true,
 				TurnTimeoutSec: 15,
 			},
+			InGame: false,
 		}
 		lm.lobbies[lobbyID] = ls
 	}
@@ -72,23 +89,38 @@ func (lm *LobbyManager) RemoveLobbyState(lobbyID uuid.UUID) {
 	delete(lm.lobbies, lobbyID)
 }
 
-// StartCountdown initiates a countdown if AutoStart is true and all players are ready.
-// It also broadcasts a "countdown_started" message to clients.
+// StartCountdown initiates a countdown if not already counting down, referencing Rules.AutoStart.
+//
+// seconds is how long the countdown lasts. After it finishes, we call OnCountdownFinish, if set.
 func (ls *LobbyState) StartCountdown(seconds int) {
+	// If already in a game or countdown is running, do nothing
+	if ls.InGame {
+		return
+	}
 	if ls.CountdownTimer != nil {
 		return
 	}
+
 	ls.BroadcastAll(map[string]interface{}{
 		"type":         "countdown_started",
 		"seconds":      seconds,
 		"auto_start":   ls.Rules.AutoStart,
 		"turn_timeout": ls.Rules.TurnTimeoutSec,
 	})
+
 	ls.CountdownTimer = time.AfterFunc(time.Duration(seconds)*time.Second, func() {
+		ls.CountdownTimer = nil
+
 		ls.BroadcastAll(map[string]interface{}{
 			"type": "countdown_finished",
 			"msg":  "All players ready, starting now...",
 		})
+
+		// If OnCountdownFinish is set, call it.
+		if ls.OnCountdownFinish != nil && !ls.InGame {
+			ls.InGame = true // mark InGame to avoid double starts
+			ls.OnCountdownFinish(ls.LobbyID)
+		}
 	})
 }
 
@@ -103,7 +135,7 @@ func (ls *LobbyState) CancelCountdown() {
 	}
 }
 
-// UpdateRules updates local memory rules. For now we only handle "auto_start".
+// UpdateRules updates local memory rules. For now we handle auto_start, turn_timeout_sec, etc.
 func (ls *LobbyState) UpdateRules(newRules map[string]interface{}) {
 	if as, ok := newRules["auto_start"].(bool); ok {
 		ls.Rules.AutoStart = as
@@ -118,7 +150,7 @@ func (ls *LobbyState) UpdateRules(newRules map[string]interface{}) {
 	})
 }
 
-// MarkUserReady checks if the user is connected and sets their ready state.
+// MarkUserReady sets a user's ready state if they're connected.
 func (ls *LobbyState) MarkUserReady(userID uuid.UUID) {
 	if _, ok := ls.Connections[userID]; !ok {
 		// user not truly connected
@@ -139,6 +171,7 @@ func (ls *LobbyState) MarkUserUnready(userID uuid.UUID) {
 	ls.CancelCountdown()
 }
 
+// BroadcastCustom sends a custom message to all in the lobby
 func (ls *LobbyState) BroadcastCustom(msg map[string]interface{}) {
 	ls.BroadcastAll(msg)
 }
@@ -168,7 +201,7 @@ func (ls *LobbyState) BroadcastJoin(userID uuid.UUID) {
 	ls.BroadcastAll(map[string]interface{}{
 		"type":      "lobby_update",
 		"user_join": userID.String(),
-		"ready_map": ls.ReadyStates, // pass the full readiness map if desired
+		"ready_map": ls.ReadyStates,
 	})
 }
 
@@ -210,6 +243,5 @@ func (ls *LobbyState) RemoveUser(userID uuid.UUID) {
 		"user_left": userID.String(),
 		"ready_map": ls.ReadyStates,
 	})
-	// Cancel countdown if any
 	ls.CancelCountdown()
 }

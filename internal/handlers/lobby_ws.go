@@ -91,6 +91,7 @@ func LobbyWSHandler(logger *logrus.Logger, lm *lobby.LobbyManager, gs *GameServe
 		}
 
 		ls := lm.GetOrCreateLobbyState(lobbyUUID)
+
 		ctx, cancel := context.WithCancel(r.Context())
 		conn := &lobby.LobbyConnection{
 			UserID:  userUUID,
@@ -144,6 +145,16 @@ func handleLobbyMessage(packet map[string]interface{}, ls *lobby.LobbyState, con
 	case "ready":
 		ls.MarkUserReady(conn.UserID)
 		if ls.Rules.AutoStart && ls.AreAllReady() {
+			if ls.OnCountdownFinish == nil {
+				ls.OnCountdownFinish = func(lID uuid.UUID) {
+					// create game now
+					g := GameServerForLobbyWS.NewCambiaGameFromLobby(context.Background(), fetchLobbyFromDB(lobbyID, logger))
+					ls.BroadcastAll(map[string]interface{}{
+						"type":    "game_start",
+						"game_id": g.ID.String(),
+					})
+				}
+			}
 			ls.StartCountdown(10)
 		}
 	case "unready":
@@ -181,6 +192,7 @@ func handleLobbyMessage(packet map[string]interface{}, ls *lobby.LobbyState, con
 			return
 		}
 		ls.CancelCountdown()
+
 		// create game now
 		g := GameServerForLobbyWS.NewCambiaGameFromLobby(context.Background(), fetchLobbyFromDB(lobbyID, logger))
 		ls.BroadcastAll(map[string]interface{}{
