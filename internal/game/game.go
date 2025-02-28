@@ -1,3 +1,4 @@
+// internal/game/game.go
 package game
 
 import (
@@ -14,6 +15,35 @@ import (
 
 // OnGameEndFunc is a function signature that can handle a finished game, broadcasting results to the lobby, etc.
 type OnGameEndFunc func(lobbyID uuid.UUID, winner uuid.UUID, scores map[uuid.UUID]int)
+
+// GameEventType is an enum-like type for broadcasting game actions.
+type GameEventType string
+
+const (
+	EventSnapSuccess              GameEventType = "player_snap_success"
+	EventSnapFail                 GameEventType = "player_snap_fail"
+	EventSnapPenalty              GameEventType = "player_snap_penalty"
+	EventReshuffle                GameEventType = "reshuffle_stockpile"
+	EventPlayerDrawStock          GameEventType = "player_draw_stockpile"
+	EventPrivateDrawStock         GameEventType = "private_draw_stockpile"
+	EventPlayerDiscard            GameEventType = "player_discard"
+	EventPlayerReplace            GameEventType = "player_replace"
+	EventPlayerSpecialChoice      GameEventType = "player_special_choice"
+	EventPlayerSpecialAction      GameEventType = "player_special_action"
+	EventPrivateSpecialAction     GameEventType = "private_special_action_success"
+	EventPrivateSpecialActionFail GameEventType = "private_special_action_fail"
+	EventPlayerCambia             GameEventType = "player_cambia"
+	EventPlayerTurn               GameEventType = "player_turn"
+)
+
+// GameEvent holds data about an event that can be broadcast to the clients in a consistent format.
+type GameEvent struct {
+	Type   GameEventType          `json:"type"`
+	UserID uuid.UUID              `json:"user,omitempty"`
+	Card   *models.Card           `json:"card,omitempty"`
+	Card2  *models.Card           `json:"card2,omitempty"`
+	Other  map[string]interface{} `json:"other,omitempty"`
+}
 
 // CambiaGame holds the entire state for a single game instance in memory.
 type CambiaGame struct {
@@ -35,7 +65,8 @@ type CambiaGame struct {
 	turnTimer    *time.Timer
 	turnDuration time.Duration
 
-	OnGameEnd OnGameEndFunc // optional callback for broadcasting results to the lobby
+	OnGameEnd   OnGameEndFunc
+	BroadcastFn func(ev GameEvent) // callback to broadcast game events (set from outside)
 
 	mu sync.Mutex
 }
@@ -82,14 +113,13 @@ func (g *CambiaGame) initializeDeck() {
 		"A": 1, "2": 2, "3": 3, "4": 4,
 		"5": 5, "6": 6, "7": 7, "8": 8,
 		"9": 9, "10": 10, "J": 11, "Q": 12,
-		"K": 13, // black kings are 13, red kings are overridden to -1
+		"K": 13, // black kings are 13, red kings => -1
 	}
 
 	var deck []*models.Card
 	for _, suit := range suits {
 		for _, rank := range ranks {
 			val := values[rank]
-			// Red King check
 			if rank == "K" && (suit == "Hearts" || suit == "Diamonds") {
 				val = -1
 			}
@@ -130,11 +160,9 @@ func (g *CambiaGame) Start() {
 	}
 	g.Started = true
 
-	// Set turnDuration from house rules (0 => no limit)
 	if g.HouseRules.TurnTimeoutSeconds() > 0 {
 		g.turnDuration = time.Duration(g.HouseRules.TurnTimeoutSeconds()) * time.Second
 	} else {
-		// 0 means no limit
 		g.turnDuration = 0
 	}
 
@@ -142,12 +170,72 @@ func (g *CambiaGame) Start() {
 	for _, p := range g.Players {
 		p.Hand = []*models.Card{}
 		for i := 0; i < 4; i++ {
-			p.Hand = append(p.Hand, g.drawCard())
+			card := g.drawTopStockpile(false)
+			if card == nil {
+				break
+			}
+			p.Hand = append(p.Hand, card)
 		}
-		// Possibly send info about first 2 cards they can peek, etc.
 	}
 
 	g.scheduleNextTurnTimer()
+	g.broadcastPlayerTurn()
+}
+
+// drawTopStockpile draws the top card from the stockpile, re-shuffling discard if needed.
+// If broadcast is true, we send a "player_draw_stockpile" event, else skip that.
+func (g *CambiaGame) drawTopStockpile(broadcast bool) *models.Card {
+	if len(g.Deck) == 0 {
+		if len(g.DiscardPile) == 0 {
+			// no cards left => forced game end?
+			g.EndGame()
+			return nil
+		}
+		// reshuffle discard
+		g.Deck = append(g.Deck, g.DiscardPile...)
+		g.DiscardPile = []*models.Card{}
+		rand.Shuffle(len(g.Deck), func(i, j int) {
+			g.Deck[i], g.Deck[j] = g.Deck[j], g.Deck[i]
+		})
+
+		// broadcast reshuffle
+		g.fireEvent(GameEvent{
+			Type: EventReshuffle,
+			Other: map[string]interface{}{
+				"stockpileSize": len(g.Deck),
+			},
+		})
+	}
+	if len(g.Deck) == 0 {
+		return nil
+	}
+	card := g.Deck[0]
+	g.Deck = g.Deck[1:]
+	if broadcast {
+		g.fireEvent(GameEvent{
+			Type:   EventPlayerDrawStock,
+			UserID: g.Players[g.CurrentPlayerIndex].ID,
+			Card:   &models.Card{ID: card.ID},
+			Other: map[string]interface{}{
+				"stockpileSize": len(g.Deck),
+			},
+		})
+	}
+	return card
+}
+
+// drawTopDiscard draws from the top of the discard if allowed and non-empty.
+func (g *CambiaGame) drawTopDiscard() *models.Card {
+	if !g.HouseRules.AllowDrawFromDiscardPile {
+		return nil
+	}
+	if len(g.DiscardPile) == 0 {
+		return nil
+	}
+	idx := len(g.DiscardPile) - 1
+	card := g.DiscardPile[idx]
+	g.DiscardPile = g.DiscardPile[:idx]
+	return card
 }
 
 // scheduleNextTurnTimer restarts a turn timer for the current player if turnDuration > 0
@@ -161,19 +249,59 @@ func (g *CambiaGame) scheduleNextTurnTimer() {
 	g.turnTimer = time.AfterFunc(g.turnDuration, func() {
 		g.mu.Lock()
 		defer g.mu.Unlock()
-
-		// If we're still on the same player, we skip or pass them
 		g.handleTimeout(g.Players[g.CurrentPlayerIndex].ID)
 	})
 }
 
 // handleTimeout applies a skip/pass if a player times out
 func (g *CambiaGame) handleTimeout(playerID uuid.UUID) {
-	log.Printf("Player %v timed out. Skipping turn.\n", playerID)
+	log.Printf("Player %v timed out. Force draw & discard.\n", playerID)
+	// default action: draw top of stock, discard it, ignoring special abilities
+	card := g.drawTopStockpile(true)
+	if card != nil {
+		g.fireEvent(GameEvent{
+			Type:   EventPrivateDrawStock,
+			UserID: playerID,
+			Card:   &models.Card{ID: card.ID, Rank: card.Rank, Suit: card.Suit, Value: card.Value},
+		})
+		// discard immediately
+		g.DiscardPile = append(g.DiscardPile, card)
+		g.fireEvent(GameEvent{
+			Type:   EventPlayerDiscard,
+			UserID: playerID,
+			Card:   card,
+		})
+	}
 	g.advanceTurn()
 }
 
-// handleDisconnect logic from old code
+// broadcastPlayerTurn notifies all players whose turn it is now
+func (g *CambiaGame) broadcastPlayerTurn() {
+	currentPID := g.Players[g.CurrentPlayerIndex].ID
+	g.fireEvent(GameEvent{
+		Type:   EventPlayerTurn,
+		UserID: currentPID,
+	})
+}
+
+// fireEvent is a helper that calls BroadcastFn if non-nil
+func (g *CambiaGame) fireEvent(ev GameEvent) {
+	if g.BroadcastFn != nil {
+		g.BroadcastFn(ev)
+	}
+}
+
+// Advance turn to next player
+func (g *CambiaGame) advanceTurn() {
+	if g.GameOver {
+		return
+	}
+	g.CurrentPlayerIndex = (g.CurrentPlayerIndex + 1) % len(g.Players)
+	g.scheduleNextTurnTimer()
+	g.broadcastPlayerTurn()
+}
+
+// HandleDisconnect logic
 func (g *CambiaGame) HandleDisconnect(playerID uuid.UUID) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -207,36 +335,45 @@ func (g *CambiaGame) markPlayerAsDisconnected(playerID uuid.UUID) {
 	}
 }
 
-// Advance turn to next player
-func (g *CambiaGame) advanceTurn() {
-	if g.GameOver {
-		return
-	}
-	g.CurrentPlayerIndex = (g.CurrentPlayerIndex + 1) % len(g.Players)
-	g.scheduleNextTurnTimer()
-}
-
-// drawCard from deck or from discard recycle if deck empty
-func (g *CambiaGame) drawCard() *models.Card {
-	if len(g.Deck) == 0 {
-		if len(g.DiscardPile) == 0 {
-			// no cards left => forced game end?
-			g.EndGame()
-			return nil
+// drawCardFromLocation picks stockpile or discard if allowed
+func (g *CambiaGame) drawCardFromLocation(playerID uuid.UUID, location string) *models.Card {
+	if location == "stockpile" {
+		card := g.drawTopStockpile(true)
+		// private reveal to drawer
+		if card != nil {
+			g.fireEvent(GameEvent{
+				Type:   EventPrivateDrawStock,
+				UserID: playerID,
+				Card:   &models.Card{ID: card.ID, Rank: card.Rank, Suit: card.Suit, Value: card.Value},
+			})
 		}
-		// reshuffle discard
-		g.Deck = append(g.Deck, g.DiscardPile...)
-		g.DiscardPile = []*models.Card{}
-		rand.Shuffle(len(g.Deck), func(i, j int) {
-			g.Deck[i], g.Deck[j] = g.Deck[j], g.Deck[i]
-		})
+		return card
+	} else if location == "discardpile" && g.HouseRules.AllowDrawFromDiscardPile {
+		card := g.drawTopDiscard()
+		if card != nil {
+			// broadcast to all
+			g.fireEvent(GameEvent{
+				Type:   EventPlayerDrawStock,
+				UserID: playerID,
+				Card:   &models.Card{ID: card.ID},
+				Other: map[string]interface{}{
+					"discardSize": len(g.DiscardPile),
+				},
+			})
+			// private reveal
+			g.fireEvent(GameEvent{
+				Type:   EventPrivateDrawStock,
+				UserID: playerID,
+				Card:   &models.Card{ID: card.ID, Rank: card.Rank, Suit: card.Suit, Value: card.Value},
+			})
+		}
+		return card
 	}
-	card := g.Deck[0]
-	g.Deck = g.Deck[1:]
-	return card
+	return nil
 }
 
-// HandlePlayerAction processes draw, discard, snap, special card usage, etc.
+// HandlePlayerAction processes draw, discard, snap, or cambia.
+// We add "action_draw_stockpile", "action_draw_discard", etc. with the new approach.
 func (g *CambiaGame) HandlePlayerAction(playerID uuid.UUID, action models.GameAction) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -244,47 +381,51 @@ func (g *CambiaGame) HandlePlayerAction(playerID uuid.UUID, action models.GameAc
 	if g.GameOver {
 		return
 	}
-	// verify it's player's turn (unless action is 'snap')
 	currentPID := g.Players[g.CurrentPlayerIndex].ID
+
+	// note: snap doesn't require it to be that player's turn
 	if action.ActionType != "snap" && playerID != currentPID {
-		// Not your turn, ignore
+		// not your turn
 		return
 	}
 
 	switch action.ActionType {
-	case "draw":
-		g.handleDraw(playerID)
-	case "discard":
-		g.handleDiscard(playerID, action.Payload)
-	case "snap":
+	case "action_snap":
 		g.handleSnap(playerID, action.Payload)
-	case "cambia":
+	case "action_draw_stockpile":
+		g.handleDrawFrom(playerID, "stockpile")
+	case "action_draw_discard":
+		g.handleDrawFrom(playerID, "discardpile")
+	case "action_discard":
+		g.handleDiscard(playerID, action.Payload)
+	case "action_replace":
+		g.handleReplace(playerID, action.Payload)
+	case "action_cambia":
 		g.handleCallCambia(playerID)
 	default:
 		log.Printf("Unknown action %s by player %v\n", action.ActionType, playerID)
 	}
 }
 
-// handleDraw example
-func (g *CambiaGame) handleDraw(playerID uuid.UUID) {
-	// draw top card
-	c := g.drawCard()
-	if c == nil {
+// handleDrawFrom draws from either stockpile or discard pile.
+func (g *CambiaGame) handleDrawFrom(playerID uuid.UUID, location string) {
+	card := g.drawCardFromLocation(playerID, location)
+	if card == nil {
+		// invalid or deck empty => do nothing
 		return
 	}
-	// In Cambia, you must either discard it or swap, etc.
-	// We'll store an ephemeral "drawnCard" in the player's state for next step
+	// store the drawn card in player's DrawnCard
 	for i := range g.Players {
 		if g.Players[i].ID == playerID {
-			g.Players[i].DrawnCard = c
+			g.Players[i].DrawnCard = card
 			break
 		}
 	}
 }
 
-// handleDiscard
+// handleDiscard discards the drawnCard or a card from hand
 func (g *CambiaGame) handleDiscard(playerID uuid.UUID, payload map[string]interface{}) {
-	cardIDStr, _ := payload["card_id"].(string)
+	cardIDStr, _ := payload["id"].(string)
 	if cardIDStr == "" {
 		return
 	}
@@ -292,24 +433,19 @@ func (g *CambiaGame) handleDiscard(playerID uuid.UUID, payload map[string]interf
 	if err != nil {
 		return
 	}
-	// find the card in the player's hand or drawnCard, discard it
+	var discarded *models.Card
 	for i := range g.Players {
 		if g.Players[i].ID == playerID {
 			p := g.Players[i]
 			if p.DrawnCard != nil && p.DrawnCard.ID == cardID {
-				g.DiscardPile = append(g.DiscardPile, p.DrawnCard)
-				g.applySpecialAbilityIfFreshlyDrawn(p.DrawnCard, playerID)
+				discarded = p.DrawnCard
 				p.DrawnCard = nil
 				break
 			} else {
 				// search in hand
 				for h := 0; h < len(p.Hand); h++ {
 					if p.Hand[h].ID == cardID {
-						g.DiscardPile = append(g.DiscardPile, p.Hand[h])
-						// if it was replaced from hand, no special ability unless house rule says so
-						if g.HouseRules.AllowDiscardAbilities {
-							g.applySpecialAbilityIfFreshlyDrawn(p.Hand[h], playerID)
-						}
+						discarded = p.Hand[h]
 						// remove from hand
 						p.Hand = append(p.Hand[:h], p.Hand[h+1:]...)
 						break
@@ -319,34 +455,82 @@ func (g *CambiaGame) handleDiscard(playerID uuid.UUID, payload map[string]interf
 			break
 		}
 	}
+	if discarded == nil {
+		// no such card
+		return
+	}
+	g.DiscardPile = append(g.DiscardPile, discarded)
+
+	// broadcast
+	g.fireEvent(GameEvent{
+		Type:   EventPlayerDiscard,
+		UserID: playerID,
+		Card: &models.Card{
+			ID:    discarded.ID,
+			Rank:  discarded.Rank,
+			Suit:  discarded.Suit,
+			Value: discarded.Value,
+		},
+	})
+
+	// check special
+	if g.HouseRules.AllowDiscardAbilities {
+		g.applySpecialAbilityIfFreshlyDrawn(discarded, playerID)
+	}
 	g.advanceTurn()
 }
 
-// applySpecialAbilityIfFreshlyDrawn handles the immediate discard actions
-func (g *CambiaGame) applySpecialAbilityIfFreshlyDrawn(c *models.Card, playerID uuid.UUID) {
-	// e.g. King => look & swap, etc.
-	switch c.Rank {
-	case "K":
-		// "Look & Swap"
-		// We'll just log for now. Real flow would let player see any 2 cards then optionally swap
-		log.Printf("Player %v discards K => can look & swap two cards", playerID)
-	case "Q", "J":
-		// "Blind Swap"
-		log.Printf("Player %v discards Q/J => can blind swap two cards", playerID)
-	case "9", "10":
-		// "Look at another's"
-		log.Printf("Player %v discards 9/10 => can look at one card of another player", playerID)
-	case "7", "8":
-		// "Look at own"
-		log.Printf("Player %v discards 7/8 => can look at one card of their own", playerID)
-	default:
-		// no special ability
+// handleReplace means the player is swapping their drawnCard with a card in their hand
+func (g *CambiaGame) handleReplace(playerID uuid.UUID, payload map[string]interface{}) {
+	idxFloat, _ := payload["idx"].(float64)
+	idx := int(idxFloat)
+
+	var replaced *models.Card
+	var fresh *models.Card
+	for i := range g.Players {
+		if g.Players[i].ID == playerID {
+			p := g.Players[i]
+			if p.DrawnCard != nil {
+				fresh = p.DrawnCard
+				p.DrawnCard = nil
+			}
+			if idx >= 0 && idx < len(p.Hand) {
+				replaced = p.Hand[idx]
+				p.Hand[idx] = fresh
+			}
+			break
+		}
 	}
+	if fresh == nil || replaced == nil {
+		// invalid
+		return
+	}
+	// replaced card goes to discard pile
+	g.DiscardPile = append(g.DiscardPile, replaced)
+	g.fireEvent(GameEvent{
+		Type:   EventPlayerReplace,
+		UserID: playerID,
+		Card:   &models.Card{ID: fresh.ID, Rank: fresh.Rank, Suit: fresh.Suit, Value: fresh.Value},
+		Other: map[string]interface{}{
+			"replaceIdx": idx,
+		},
+	})
+	// also broadcast the discard
+	g.fireEvent(GameEvent{
+		Type:   EventPlayerDiscard,
+		UserID: playerID,
+		Card:   &models.Card{ID: replaced.ID, Rank: replaced.Rank, Suit: replaced.Suit, Value: replaced.Value},
+	})
+
+	if g.HouseRules.AllowDiscardAbilities {
+		g.applySpecialAbilityIfFreshlyDrawn(replaced, playerID)
+	}
+	g.advanceTurn()
 }
 
-// handleSnap
+// handleSnap ...
 func (g *CambiaGame) handleSnap(playerID uuid.UUID, payload map[string]interface{}) {
-	cardIDStr, _ := payload["card_id"].(string)
+	cardIDStr, _ := payload["id"].(string)
 	if cardIDStr == "" {
 		return
 	}
@@ -354,20 +538,19 @@ func (g *CambiaGame) handleSnap(playerID uuid.UUID, payload map[string]interface
 	if err != nil {
 		return
 	}
-	// The user claims the top of the discard is the same rank.
 	if len(g.DiscardPile) == 0 {
-		// invalid
-		g.penalizeSnapFail(playerID)
+		g.penalizeSnapFail(playerID, nil)
 		return
 	}
 	lastDiscard := g.DiscardPile[len(g.DiscardPile)-1]
 	var snapCard *models.Card
-	// check the player's hand if that card matches the last discard rank
+	var snapPlayer *models.Player
 	for i := range g.Players {
 		if g.Players[i].ID == playerID {
-			for h := 0; h < len(g.Players[i].Hand); h++ {
-				if g.Players[i].Hand[h].ID == cardID {
-					snapCard = g.Players[i].Hand[h]
+			snapPlayer = g.Players[i]
+			for h := 0; h < len(snapPlayer.Hand); h++ {
+				if snapPlayer.Hand[h].ID == cardID {
+					snapCard = snapPlayer.Hand[h]
 					break
 				}
 			}
@@ -375,58 +558,68 @@ func (g *CambiaGame) handleSnap(playerID uuid.UUID, payload map[string]interface
 		}
 	}
 	if snapCard == nil {
-		// not found
-		g.penalizeSnapFail(playerID)
+		g.penalizeSnapFail(playerID, nil)
 		return
 	}
 	if snapCard.Rank == lastDiscard.Rank {
 		// success
 		log.Printf("Player %v snap success with rank %s", playerID, snapCard.Rank)
-		// remove from player's hand
 		g.removeCardFromPlayerHand(playerID, cardID)
-		// discard it
 		g.DiscardPile = append(g.DiscardPile, snapCard)
-		// if it's from your own hand, you remain with fewer cards
-		// if from an opponent's, you'd also do the step of moving one of your cards to them, etc.
+		// broadcast success
+		g.fireEvent(GameEvent{
+			Type:   EventSnapSuccess,
+			UserID: playerID,
+			Card:   &models.Card{ID: snapCard.ID, Rank: snapCard.Rank, Suit: snapCard.Suit, Value: snapCard.Value},
+		})
 	} else {
-		// fail
-		g.penalizeSnapFail(playerID)
+		g.penalizeSnapFail(playerID, snapCard)
 	}
 }
 
-// removeCardFromPlayerHand convenience
-func (g *CambiaGame) removeCardFromPlayerHand(playerID, cardID uuid.UUID) {
-	for i := range g.Players {
-		if g.Players[i].ID == playerID {
-			p := g.Players[i]
-			newHand := []*models.Card{}
-			for _, c := range p.Hand {
-				if c.ID != cardID {
-					newHand = append(newHand, c)
-				}
-			}
-			p.Hand = newHand
-			return
-		}
+func (g *CambiaGame) penalizeSnapFail(playerID uuid.UUID, attemptedCard *models.Card) {
+	log.Printf("Player %v snap fail", playerID)
+	if attemptedCard != nil {
+		g.fireEvent(GameEvent{
+			Type:   EventSnapFail,
+			UserID: playerID,
+			Card:   &models.Card{ID: attemptedCard.ID, Rank: attemptedCard.Rank, Suit: attemptedCard.Suit, Value: attemptedCard.Value},
+		})
+	} else {
+		g.fireEvent(GameEvent{
+			Type:   EventSnapFail,
+			UserID: playerID,
+		})
 	}
-}
-
-// penalizeSnapFail deals penalty cards to the snapper
-func (g *CambiaGame) penalizeSnapFail(playerID uuid.UUID) {
+	// draw penalty
 	penalty := g.HouseRules.PenaltyCardCount
 	if penalty < 1 {
 		penalty = 2
 	}
 	for i := 0; i < penalty; i++ {
-		c := g.drawCard()
-		if c == nil {
-			// deck exhausted => game end
+		card := g.drawTopStockpile(false)
+		if card == nil {
 			break
 		}
+		// broadcast public
+		g.fireEvent(GameEvent{
+			Type:   EventSnapPenalty,
+			UserID: playerID,
+			Card:   &models.Card{ID: card.ID},
+		})
+		// private
+		g.fireEvent(GameEvent{
+			Type:   EventPrivateDrawStock,
+			UserID: playerID,
+			Card:   &models.Card{ID: card.ID, Rank: card.Rank, Suit: card.Suit, Value: card.Value},
+			Other: map[string]interface{}{
+				"idx": i,
+			},
+		})
 		// add to player's hand
 		for j := range g.Players {
 			if g.Players[j].ID == playerID {
-				g.Players[j].Hand = append(g.Players[j].Hand, c)
+				g.Players[j].Hand = append(g.Players[j].Hand, card)
 				break
 			}
 		}
@@ -436,15 +629,26 @@ func (g *CambiaGame) penalizeSnapFail(playerID uuid.UUID) {
 // handleCallCambia => end game after other players get 1 more turn
 func (g *CambiaGame) handleCallCambia(playerID uuid.UUID) {
 	log.Printf("Player %v calls Cambia", playerID)
-	// each other player gets 1 more turn
+	// broadcast
+	g.fireEvent(GameEvent{
+		Type:   EventPlayerCambia,
+		UserID: playerID,
+	})
 	g.advanceTurn()
+	// in real cambia, we let each other player have one more turn, then end
+	// for brevity, we won't implement that right now
+}
+
+// applySpecialAbilityIfFreshlyDrawn handles the immediate discard actions
+func (g *CambiaGame) applySpecialAbilityIfFreshlyDrawn(c *models.Card, playerID uuid.UUID) {
+	// Placeholder: you'd handle Q, J, K, 7,8,9,10 logic here.
+	// Then you'd broadcast e.g. "player_special_choice", etc.
 }
 
 // EndGame finalizes scoring, sets GameOver, and calls OnGameEnd if present.
 func (g *CambiaGame) EndGame() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-
 	if g.GameOver {
 		return
 	}
@@ -496,54 +700,28 @@ func findWinners(scores map[uuid.UUID]int) []uuid.UUID {
 	return winners
 }
 
-// persistResults writes final game_results, updates rating, etc.
+// persistResults is called optionally if you want to store final results in DB
 func (g *CambiaGame) persistResults(finalScores map[uuid.UUID]int, winners []uuid.UUID) {
 	ctx := context.Background()
-
-	// Insert game row in DB if needed, or mark existing game as completed
-	// Insert game_results for each player
-	// For rating, we do a Glicko2 update for 1v1, 4p, or 7p8p, using your multi-player approach
 	err := database.RecordGameAndResults(ctx, g.ID, g.Players, finalScores, winners)
 	if err != nil {
 		log.Printf("Error persisting results: %v", err)
 	}
 }
 
-func fetchParticipants(ctx context.Context, lobbyID uuid.UUID) ([]*models.Player, error) {
-	q := `
-		SELECT p.user_id, p.seat_position, u.username, u.is_ephemeral
-		FROM lobby_participants p
-		JOIN users u ON p.user_id = u.id
-		WHERE p.lobby_id = $1
-		ORDER BY p.seat_position
-	`
-	rows, err := database.DB.Query(ctx, q, lobbyID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var players []*models.Player
-	for rows.Next() {
-		var (
-			userID    uuid.UUID
-			seatPos   int
-			username  string
-			ephemeral bool
-		)
-		if err := rows.Scan(&userID, &seatPos, &username, &ephemeral); err != nil {
-			return nil, err
+// removeCardFromPlayerHand convenience
+func (g *CambiaGame) removeCardFromPlayerHand(playerID, cardID uuid.UUID) {
+	for i := range g.Players {
+		if g.Players[i].ID == playerID {
+			p := g.Players[i]
+			newHand := []*models.Card{}
+			for _, c := range p.Hand {
+				if c.ID != cardID {
+					newHand = append(newHand, c)
+				}
+			}
+			p.Hand = newHand
+			return
 		}
-		players = append(players, &models.Player{
-			ID:        userID,
-			Hand:      []*models.Card{},
-			Connected: true,
-			User: &models.User{
-				ID:          userID,
-				Username:    username,
-				IsEphemeral: ephemeral,
-			},
-		})
 	}
-	return players, nil
 }

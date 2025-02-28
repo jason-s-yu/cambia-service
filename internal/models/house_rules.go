@@ -27,6 +27,9 @@ type HouseRules struct {
 
 	// AutoStart indicates if the lobby automatically starts the countdown once all players are ready.
 	AutoStart bool
+
+	// AllowDrawFromDiscardPile allows a player to draw from the top of the discard pile instead of the stockpile.
+	AllowDrawFromDiscardPile bool
 }
 
 // TurnTimeoutSeconds returns the configured turn timeout or 0 if no limit.

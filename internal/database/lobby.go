@@ -11,7 +11,6 @@ import (
 )
 
 // InsertLobby creates a new lobby row in the DB.
-// Additional house-rule fields can be inserted as needed.
 func InsertLobby(ctx context.Context, lobby *models.Lobby) error {
 	q := `
 	INSERT INTO lobbies (
@@ -24,13 +23,15 @@ func InsertLobby(ctx context.Context, lobby *models.Lobby) error {
 		allow_replaced_discard_abilities,
 		disconnection_threshold,
 		turn_timeout_sec,
-		auto_start
+		auto_start,
+		allow_draw_from_discard_pile
 	)
 	VALUES ($1, $2, $3, $4,
 	        $5, $6,
 	        $7, $8, $9,
 	        $10, $11,
-	        $12, $13, $14)
+	        $12, $13, $14,
+	        $15)
 	`
 	return pgx.BeginTxFunc(ctx, DB, pgx.TxOptions{}, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, q,
@@ -48,6 +49,7 @@ func InsertLobby(ctx context.Context, lobby *models.Lobby) error {
 			lobby.HouseRules.DisconnectionRoundLimit,
 			lobby.HouseRules.TurnTimeoutSec,
 			lobby.HouseRules.AutoStart,
+			lobby.HouseRules.AllowDrawFromDiscardPile,
 		)
 		return err
 	})
@@ -67,7 +69,8 @@ func GetLobby(ctx context.Context, lobbyID uuid.UUID) (*models.Lobby, error) {
 		allow_replaced_discard_abilities,
 		disconnection_threshold,
 		turn_timeout_sec,
-		auto_start
+		auto_start,
+		allow_draw_from_discard_pile
 	FROM lobbies
 	WHERE id = $1
 	`
@@ -86,11 +89,63 @@ func GetLobby(ctx context.Context, lobbyID uuid.UUID) (*models.Lobby, error) {
 		&l.HouseRules.DisconnectionRoundLimit,
 		&l.HouseRules.TurnTimeoutSec,
 		&l.HouseRules.AutoStart,
+		&l.HouseRules.AllowDrawFromDiscardPile,
 	)
 	if err != nil {
 		return nil, err
 	}
 	return &l, nil
+}
+
+// GetAllLobbies returns a slice of all lobbies in the DB.
+func GetAllLobbies(ctx context.Context) ([]models.Lobby, error) {
+	q := `
+		SELECT 
+			id, host_user_id, type, circuit_mode,
+			ranked, ranking_mode,
+			house_rule_freeze_disconnect,
+			house_rule_forfeit_disconnect,
+			house_rule_missed_round_threshold,
+			penalty_card_count,
+			allow_replaced_discard_abilities,
+			disconnection_threshold,
+			turn_timeout_sec,
+			auto_start,
+			allow_draw_from_discard_pile
+		FROM lobbies
+	`
+	rows, err := DB.Query(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var lobbies []models.Lobby
+	for rows.Next() {
+		var l models.Lobby
+		err := rows.Scan(
+			&l.ID,
+			&l.HostUserID,
+			&l.Type,
+			&l.CircuitMode,
+			&l.Ranked,
+			&l.RankingMode,
+			&l.HouseRules.FreezeOnDisconnect,
+			&l.HouseRules.ForfeitOnDisconnect,
+			&l.HouseRules.MissedRoundThreshold,
+			&l.HouseRules.PenaltyCardCount,
+			&l.HouseRules.AllowDiscardAbilities,
+			&l.HouseRules.DisconnectionRoundLimit,
+			&l.HouseRules.TurnTimeoutSec,
+			&l.HouseRules.AutoStart,
+			&l.HouseRules.AllowDrawFromDiscardPile,
+		)
+		if err != nil {
+			return nil, err
+		}
+		lobbies = append(lobbies, l)
+	}
+	return lobbies, nil
 }
 
 // InsertParticipant inserts a user into lobby_participants with a seat position.
@@ -137,55 +192,6 @@ func RemoveUserFromLobby(ctx context.Context, userID uuid.UUID, lobbyID uuid.UUI
 		_, err := tx.Exec(ctx, q, lobbyID, userID)
 		return err
 	})
-}
-
-// GetAllLobbies returns a slice of all lobbies in the DB.
-func GetAllLobbies(ctx context.Context) ([]models.Lobby, error) {
-	q := `
-		SELECT 
-			id, host_user_id, type, circuit_mode,
-			ranked, ranking_mode,
-			house_rule_freeze_disconnect,
-			house_rule_forfeit_disconnect,
-			house_rule_missed_round_threshold,
-			penalty_card_count,
-			allow_replaced_discard_abilities,
-			disconnection_threshold,
-			turn_timeout_sec,
-			auto_start
-		FROM lobbies
-	`
-	rows, err := DB.Query(ctx, q)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var lobbies []models.Lobby
-	for rows.Next() {
-		var l models.Lobby
-		err := rows.Scan(
-			&l.ID,
-			&l.HostUserID,
-			&l.Type,
-			&l.CircuitMode,
-			&l.Ranked,
-			&l.RankingMode,
-			&l.HouseRules.FreezeOnDisconnect,
-			&l.HouseRules.ForfeitOnDisconnect,
-			&l.HouseRules.MissedRoundThreshold,
-			&l.HouseRules.PenaltyCardCount,
-			&l.HouseRules.AllowDiscardAbilities,
-			&l.HouseRules.DisconnectionRoundLimit,
-			&l.HouseRules.TurnTimeoutSec,
-			&l.HouseRules.AutoStart,
-		)
-		if err != nil {
-			return nil, err
-		}
-		lobbies = append(lobbies, l)
-	}
-	return lobbies, nil
 }
 
 // DeleteLobby removes a lobby row from the DB by ID. We also remove participants.

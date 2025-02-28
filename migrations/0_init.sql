@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS lobbies (
     house_rule_freeze_disconnect      BOOLEAN NOT NULL DEFAULT FALSE,
     house_rule_forfeit_disconnect     BOOLEAN NOT NULL DEFAULT FALSE,
     house_rule_missed_round_threshold SMALLINT NOT NULL DEFAULT 2,
+    allow_draw_from_discard_pile      BOOLEAN NOT NULL DEFAULT false,
     penalty_card_count                SMALLINT NOT NULL DEFAULT 2,
     allow_replaced_discard_abilities  BOOLEAN NOT NULL DEFAULT FALSE,
     disconnection_threshold           SMALLINT NOT NULL DEFAULT 2,

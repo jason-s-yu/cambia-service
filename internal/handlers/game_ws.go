@@ -4,7 +4,6 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strings"
 
@@ -32,11 +31,23 @@ func GameWSHandler(logger *logrus.Logger, gs *GameServer) http.HandlerFunc {
 			return
 		}
 
-		// attempt to get the in-memory game
 		g, ok := gs.GameStore.GetGame(gameID)
 		if !ok {
 			http.Error(w, "game not found", http.StatusNotFound)
 			return
+		}
+
+		// if not set, set the broadcast callback
+		if g.BroadcastFn == nil {
+			g.BroadcastFn = func(ev game.GameEvent) {
+				// broadcast to all players
+				for _, pl := range g.Players {
+					if pl.Conn != nil {
+						data, _ := json.Marshal(ev)
+						pl.Conn.Write(context.Background(), websocket.MessageText, data)
+					}
+				}
+			}
 		}
 
 		// upgrade to websocket with subprotocol=game
@@ -80,11 +91,12 @@ func GameWSHandler(logger *logrus.Logger, gs *GameServer) http.HandlerFunc {
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
 
-		// read loop
-		readGameMessages(ctx, g, p, logger)
+		go readGameMessages(ctx, g, p, logger)
 	}
 }
 
+// readGameMessages listens for JSON messages from a single player's WS.
+// We parse the "type" field and any "payload" to handle "action_*" commands.
 func readGameMessages(ctx context.Context, g *game.CambiaGame, p *models.Player, logger *logrus.Logger) {
 	defer func() {
 		p.Conn.Close(websocket.StatusNormalClosure, "closing")
@@ -102,26 +114,74 @@ func readGameMessages(ctx context.Context, g *game.CambiaGame, p *models.Player,
 		}
 
 		var msg struct {
-			Action  string                 `json:"action"`
-			Payload map[string]interface{} `json:"payload"`
+			Type    string                 `json:"type"`
+			Card    map[string]interface{} `json:"card,omitempty"`
+			Payload map[string]interface{} `json:"payload,omitempty"`
 		}
 		if e := json.Unmarshal(data, &msg); e != nil {
 			logger.Warnf("invalid json from user %v: %v", p.ID, e)
 			continue
 		}
 
-		switch msg.Action {
-		case "draw", "discard", "snap", "cambia":
-			// handle the game logic
-			action := models.GameAction{
-				ActionType: msg.Action,
-				Payload:    msg.Payload,
+		switch msg.Type {
+		// "action_snap", "action_draw_stockpile", "action_draw_discard", "action_discard", "action_replace", "action_cambia"
+		case "action_snap":
+			var act models.GameAction
+			act.ActionType = "action_snap"
+			if msg.Card != nil {
+				idStr, _ := msg.Card["id"].(string)
+				act.Payload = map[string]interface{}{
+					"id": idStr,
+				}
 			}
-			g.HandlePlayerAction(p.ID, action)
+			g.HandlePlayerAction(p.ID, act)
+
+		case "action_draw_stockpile":
+			g.HandlePlayerAction(p.ID, models.GameAction{
+				ActionType: "action_draw_stockpile",
+				Payload:    map[string]interface{}{},
+			})
+
+		case "action_draw_discard":
+			g.HandlePlayerAction(p.ID, models.GameAction{
+				ActionType: "action_draw_discard",
+				Payload:    map[string]interface{}{},
+			})
+
+		case "action_discard":
+			var act models.GameAction
+			act.ActionType = "action_discard"
+			if msg.Card != nil {
+				idStr, _ := msg.Card["id"].(string)
+				act.Payload = map[string]interface{}{
+					"id": idStr,
+				}
+			}
+			g.HandlePlayerAction(p.ID, act)
+
+		case "action_replace":
+			var act models.GameAction
+			act.ActionType = "action_replace"
+			if msg.Card != nil {
+				idStr, _ := msg.Card["id"].(string)
+				idxFloat, _ := msg.Card["idx"].(float64)
+				act.Payload = map[string]interface{}{
+					"id":  idStr,
+					"idx": idxFloat,
+				}
+			}
+			g.HandlePlayerAction(p.ID, act)
+
+		case "action_cambia":
+			g.HandlePlayerAction(p.ID, models.GameAction{
+				ActionType: "action_cambia",
+			})
+
 		case "ping":
 			_ = p.Conn.Write(ctx, websocket.MessageText, []byte(`{"action":"pong"}`))
+
 		default:
-			fmt.Printf("Unknown game action '%s' from user %v\n", msg.Action, p.ID)
+			logger.Warnf("Unknown game action '%s' from user %v", msg.Type, p.ID)
 		}
 	}
 }
