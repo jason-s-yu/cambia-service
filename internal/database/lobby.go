@@ -2,7 +2,6 @@ package database
 
 import (
 	"context"
-	"database/sql"
 	"math/rand"
 
 	"github.com/google/uuid"
@@ -176,7 +175,7 @@ func IsUserInLobby(ctx context.Context, lobbyID, userID uuid.UUID) (bool, error)
 	`
 	var tmp int
 	err := DB.QueryRow(ctx, q, lobbyID, userID).Scan(&tmp)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return false, nil
 	}
 	if err != nil {
