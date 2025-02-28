@@ -4,8 +4,9 @@ package handlers
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync"
+
+	log "github.com/sirupsen/logrus"
 
 	"github.com/google/uuid"
 	"github.com/jason-s-yu/cambia/internal/database"
@@ -13,41 +14,28 @@ import (
 	"github.com/jason-s-yu/cambia/internal/models"
 )
 
-// GlobalLobbyManager is needed so we can broadcast the end-of-game results to the right lobby
-var GlobalLobbyManager *game.LobbyManager
-
 // GameServer is a high-level struct that holds a reference to a GameStore
 // and can create new games from lobbies
 type GameServer struct {
-	Mutex     sync.Mutex
-	GameStore *game.GameStore
-	Logf      func(f string, v ...interface{})
+	Mutex      sync.Mutex
+	LobbyStore *game.LobbyStore
+	GameStore  *game.GameStore
 }
 
 func NewGameServer() *GameServer {
 	return &GameServer{
-		GameStore: game.NewGameStore(),
-		Logf:      log.Printf,
+		LobbyStore: game.NewLobbyStore(),
+		GameStore:  game.NewGameStore(),
+		Mutex:      sync.Mutex{},
 	}
 }
 
 // NewCambiaGameFromLobby fetches participants, creates an in-memory CambiaGame
-func (gs *GameServer) NewCambiaGameFromLobby(ctx context.Context, lobby *models.Lobby) *game.CambiaGame {
+func (gs *GameServer) NewCambiaGameFromLobby(ctx context.Context, lobby *game.Lobby) *game.CambiaGame {
 	g := game.NewCambiaGame()
 	g.LobbyID = lobby.ID
 
-	houseRules := models.HouseRules{
-		FreezeOnDisconnect:      lobby.HouseRules.FreezeOnDisconnect,
-		ForfeitOnDisconnect:     lobby.HouseRules.ForfeitOnDisconnect,
-		MissedRoundThreshold:    lobby.HouseRules.MissedRoundThreshold,
-		PenaltyCardCount:        lobby.HouseRules.PenaltyCardCount,
-		AllowDiscardAbilities:   lobby.HouseRules.AllowDiscardAbilities,
-		DisconnectionRoundLimit: lobby.HouseRules.DisconnectionRoundLimit,
-		TurnTimeoutSec:          lobby.HouseRules.TurnTimeoutSec,
-		AutoStart:               lobby.HouseRules.AutoStart,
-	}
-
-	g.HouseRules = houseRules
+	g.HouseRules = lobby.HouseRules
 
 	participants, err := fetchLobbyParticipants(ctx, lobby.ID)
 	if err != nil {
@@ -57,10 +45,10 @@ func (gs *GameServer) NewCambiaGameFromLobby(ctx context.Context, lobby *models.
 
 	// Set OnGameEnd callback
 	g.OnGameEnd = func(lobbyID uuid.UUID, winner uuid.UUID, scores map[uuid.UUID]int) {
-		// broadcast to the lobby that the game ended, reset readiness
-		ls := GlobalLobbyManager.GetOrCreateLobbyState(lobbyID) // or if we have an existing state
-		for uid := range ls.ReadyStates {
-			ls.ReadyStates[uid] = false
+		if ls, exists := gs.LobbyStore.GetLobby(lobbyID); exists {
+			for uid := range ls.Connections {
+				ls.ReadyStates[uid] = false
+			}
 		}
 		resultMsg := map[string]interface{}{
 			"type":   "game_results",
@@ -75,6 +63,9 @@ func (gs *GameServer) NewCambiaGameFromLobby(ctx context.Context, lobby *models.
 	}
 
 	gs.GameStore.AddGame(g)
+
+	g.Start()
+
 	return g
 }
 

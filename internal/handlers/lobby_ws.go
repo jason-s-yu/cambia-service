@@ -36,7 +36,7 @@ var GameServerForLobbyWS *GameServer
 //
 // Returns:
 // - An http.HandlerFunc that handles the WebSocket connection.
-func LobbyWSHandler(logger *logrus.Logger, lm *game.LobbyManager, gs *GameServer) http.HandlerFunc {
+func LobbyWSHandler(logger *logrus.Logger, lm *game.LobbyStore, gs *GameServer) http.HandlerFunc {
 	GameServerForLobbyWS = gs
 	return func(w http.ResponseWriter, r *http.Request) {
 		pathParts := strings.Split(strings.TrimPrefix(r.URL.Path, "/lobby/ws/"), "/")

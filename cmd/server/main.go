@@ -39,7 +39,7 @@ func main() {
 	handlers.GlobalGameServer = gameSrv
 
 	// lobby manager
-	lm := game.NewLobbyManager()
+	lm := game.NewLobbyStore()
 	handlers.GlobalLobbyManager = lm
 
 	mux.Handle("/game/ws/", middleware.LogMiddleware(logger)(http.HandlerFunc(

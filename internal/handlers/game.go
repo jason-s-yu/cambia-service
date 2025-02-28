@@ -1,106 +1,48 @@
+// internal/handlers/game.go
 package handlers
 
 import (
-	"context"
 	"encoding/json"
-	"fmt"
-	"log"
 	"net/http"
 	"strings"
 
-	"github.com/coder/websocket"
 	"github.com/google/uuid"
 	"github.com/jason-s-yu/cambia/internal/auth"
 	"github.com/jason-s-yu/cambia/internal/game"
-	"github.com/jason-s-yu/cambia/internal/models"
 )
 
+// ServeHTTP is a HTTP handler that parses routes to /game/ws and redirects to the appropriate controller.
+//
+// Deprecated: this function no longer handles the read loop. For WS, see game_ws.go's GameWSHandler.
 func (s *GameServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// e.g. POST /game/create
 	if r.URL.Path == "/game/create" && r.Method == http.MethodPost {
 		s.handleCreateGame(w, r)
 		return
 	}
 
+	// e.g. GET /game/reconnect/{uuid}
 	if strings.HasPrefix(r.URL.Path, "/game/reconnect/") {
 		s.handleReconnect(w, r)
 		return
 	}
 
-	// otherwise treat it as a WS join
-	gameIDStr := strings.TrimPrefix(r.URL.Path, "/game/")
-	gameID, err := uuid.Parse(gameIDStr)
-	if err != nil {
-		http.Error(w, "invalid game id", http.StatusBadRequest)
-		return
-	}
+	// otherwise, if you want WebSocket, see game_ws.go
+	http.Error(w, "unsupported route, use /game/ws/{id} for websockets", http.StatusNotFound)
+}
 
-	g, ok := s.GameStore.GetGame(gameID)
-	if !ok {
-		http.Error(w, "game not found", http.StatusNotFound)
-		return
-	}
+// handleCreateGame simply creates a new in-memory CambiaGame for debugging.
+func (s *GameServer) handleCreateGame(w http.ResponseWriter, r *http.Request) {
+	cg := game.NewCambiaGame()
+	s.GameStore.AddGame(cg)
 
-	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		Subprotocols: []string{"game"},
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"game_id": cg.ID,
 	})
-	if err != nil {
-		log.Printf("websocket accept failed: %v", err)
-		return
-	}
-	if c.Subprotocol() != "game" {
-		c.Close(websocket.StatusPolicyViolation, "client must speak the game subprotocol")
-		return
-	}
-
-	// identify user from cookie (ephemeral or permanent)
-	userID, _ := EnsureEphemeralUser(w, r) // if no valid token, create ephemeral
-	player := &models.Player{
-		ID:        userID,
-		Hand:      []*models.Card{},
-		Connected: true,
-		Conn:      c,
-		User:      nil, // TODO: check if user needed
-	}
-
-	g.AddPlayer(player)
-
-	go s.handleWSMessages(g, player)
 }
 
-func (s *GameServer) handleWSMessages(g *game.CambiaGame, p *models.Player) {
-	defer func() {
-		p.Conn.Close(websocket.StatusNormalClosure, "closing")
-		g.HandleDisconnect(p.ID)
-	}()
-
-	ctx := context.Background()
-	for {
-		typ, msg, err := p.Conn.Read(ctx)
-		if err != nil {
-			log.Printf("read err from user %v: %v", p.ID, err)
-			return
-		}
-		if typ == websocket.MessageText {
-			var req map[string]interface{}
-			if err := json.Unmarshal(msg, &req); err != nil {
-				log.Printf("invalid json from user %v: %v", p.ID, err)
-				continue
-			}
-			// parse "action"
-			action, _ := req["action"].(string)
-			switch action {
-			case "draw":
-				// handle draw
-			case "disconnect":
-				// simulate user closing
-				return
-			default:
-				fmt.Printf("Unknown action %v from user %v\n", action, p.ID)
-			}
-		}
-	}
-}
-
+// handleReconnect is an example route if you want to reconnect a user by HTTP, but the WS approach is recommended.
 func (s *GameServer) handleReconnect(w http.ResponseWriter, r *http.Request) {
 	gameIDStr := strings.TrimPrefix(r.URL.Path, "/game/reconnect/")
 	gameID, err := uuid.Parse(gameIDStr)
@@ -123,15 +65,4 @@ func (s *GameServer) handleReconnect(w http.ResponseWriter, r *http.Request) {
 
 	g.HandleReconnect(userUUID)
 	w.Write([]byte("Reconnected successfully. Now open WebSocket again to continue."))
-}
-
-func (s *GameServer) handleCreateGame(w http.ResponseWriter, r *http.Request) {
-	// create a new CambiaGame, add to store
-	cg := game.NewCambiaGame()
-	s.GameStore.AddGame(cg)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"game_id": cg.ID,
-	})
 }

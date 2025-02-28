@@ -13,15 +13,23 @@ import (
 	"github.com/google/uuid"
 	"github.com/jason-s-yu/cambia/internal/auth"
 	"github.com/jason-s-yu/cambia/internal/database"
-	"github.com/jason-s-yu/cambia/internal/models"
+	"github.com/jason-s-yu/cambia/internal/game"
 )
 
-// validLobbyTypes enumerates the only allowed lobby type strings
-var ValidLobbyTypes = map[string]bool{
-	"private":     true,
-	"public":      true,
-	"matchmaking": true,
-}
+var (
+	validGameTypes = map[string]bool{
+		"private":     true,
+		"public":      true,
+		"matchmaking": true,
+	}
+	validGameModes = map[string]bool{
+		"head_to_head": true,
+		"group_of_4":   true,
+		"circuit_4p":   true,
+		"circuit_7p8p": true,
+		"custom":       true,
+	}
+)
 
 // GlobalGameServer is the global instance that can be set by InitLobbyHandlers, if desired.
 var GlobalGameServer *GameServer
@@ -31,44 +39,7 @@ func InitLobbyHandlers(gs *GameServer) {
 	GlobalGameServer = gs
 }
 
-// CreateLobbyHandler handles the creation of a new lobby. It also creates a new CambiaGame
-// and returns the "game_id" in the response so clients can connect to the game WS.
-//
-// JSON request structure:
-//
-//	{
-//	  "type": "private",
-//	  "circuit_mode": false,
-//	  "ranked": false,
-//	  "ranking_mode": "1v1",
-//	  "rules": {
-//	    "disconnection_threshold": 2,
-//	    "house_rule_freeze_disconnect": false,
-//	    "house_rule_forfeit_disconnect": false,
-//	    "house_rule_missed_round_threshold": 2,
-//	    "penalty_card_count": 2,
-//	    "allow_replaced_discard_abilities": false
-//	  }
-//	}
-//
-// Sample response:
-//
-//	{
-//	  "id": "...",
-//	  "host_user_id": "...",
-//	  "type": "private",
-//	  "circuit_mode": false,
-//	  "ranked": false,
-//	  "ranking_mode": "1v1",
-//	  "disconnection_threshold": 2,
-//	  ...
-//	  "rules": {
-//	    "disconnection_threshold": 2,
-//	    "house_rule_freeze_disconnect": false,
-//	    ...
-//	  },
-//	  "game_id": "<some-game-id>"
-//	}
+// CreateLobbyHandler handles the creation of a new lobby and adds it to the lobby store
 func CreateLobbyHandler(w http.ResponseWriter, r *http.Request) {
 	cookie := r.Header.Get("Cookie")
 	if !strings.Contains(cookie, "auth_token=") {
@@ -88,88 +59,25 @@ func CreateLobbyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req struct {
-		Type        string `json:"type"`
-		CircuitMode bool   `json:"circuit_mode"`
-		Ranked      bool   `json:"ranked"`
-		RankingMode string `json:"ranking_mode"`
+	lobby := game.NewLobbyWithDefaults(userID)
 
-		HouseRules struct {
-			DisconnectionThreshold        int  `json:"disconnection_threshold"`
-			HouseRuleFreezeDisconnect     bool `json:"house_rule_freeze_disconnect"`
-			HouseRuleForfeitDisconnect    bool `json:"house_rule_forfeit_disconnect"`
-			HouseRuleMissedRoundThreshold int  `json:"house_rule_missed_round_threshold"`
-			PenaltyCardCount              int  `json:"penalty_card_count"`
-			AllowReplacedDiscardAbilities bool `json:"allow_replaced_discard_abilities"`
-
-			// newly recognized
-			AutoStart      bool `json:"auto_start"`
-			TurnTimeoutSec int  `json:"turn_timeout_sec"`
-		} `json:"house_rules"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(lobby); err != nil {
 		http.Error(w, "bad lobby request payload", http.StatusBadRequest)
 		return
 	}
-	if !ValidLobbyTypes[req.Type] {
-		http.Error(w, fmt.Sprintf("invalid lobby type '%s'", req.Type), http.StatusBadRequest)
+
+	if lobby.Type != "" && !validGameTypes[lobby.Type] {
+		http.Error(w, "invalid lobby type", http.StatusBadRequest)
 		return
 	}
 
-	lobbyID := uuid.Must(uuid.NewRandom())
-	lobby := models.Lobby{
-		ID:          lobbyID,
-		HostUserID:  userID,
-		Type:        req.Type,
-		CircuitMode: req.CircuitMode,
-		Ranked:      req.Ranked,
-		RankingMode: req.RankingMode,
-		HouseRules: models.HouseRules{
-			DisconnectionRoundLimit: req.HouseRules.DisconnectionThreshold,
-			FreezeOnDisconnect:      req.HouseRules.HouseRuleFreezeDisconnect,
-			ForfeitOnDisconnect:     req.HouseRules.HouseRuleForfeitDisconnect,
-			MissedRoundThreshold:    req.HouseRules.HouseRuleMissedRoundThreshold,
-			PenaltyCardCount:        req.HouseRules.PenaltyCardCount,
-			AllowDiscardAbilities:   req.HouseRules.AllowReplacedDiscardAbilities,
-			AutoStart:               req.HouseRules.AutoStart,
-			TurnTimeoutSec:          req.HouseRules.TurnTimeoutSec,
-		},
-	}
-
-	ctx := r.Context()
-	if err := database.InsertLobby(ctx, &lobby); err != nil {
-		http.Error(w, fmt.Sprintf("failed to create lobby: %v", err), http.StatusInternalServerError)
+	if lobby.GameMode != "" && !validGameModes[lobby.GameMode] {
+		http.Error(w, "invalid game mode", http.StatusBadRequest)
 		return
-	}
-
-	// auto-join the host
-	if err := database.InsertParticipant(ctx, lobbyID, userID, 1); err != nil {
-		http.Error(w, fmt.Sprintf("failed to insert host participant: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	resp := map[string]interface{}{
-		"id":           lobby.ID.String(),
-		"host_user_id": lobby.HostUserID.String(),
-		"type":         lobby.Type,
-		"circuit_mode": lobby.CircuitMode,
-		"ranked":       lobby.Ranked,
-		"ranking_mode": lobby.RankingMode,
-		"house_rules": map[string]interface{}{
-			"disconnection_threshold":           lobby.HouseRules.DisconnectionRoundLimit,
-			"house_rule_freeze_disconnect":      lobby.HouseRules.FreezeOnDisconnect,
-			"house_rule_forfeit_disconnect":     lobby.HouseRules.ForfeitOnDisconnect,
-			"house_rule_missed_round_threshold": lobby.HouseRules.MissedRoundThreshold,
-			"penalty_card_count":                lobby.HouseRules.PenaltyCardCount,
-			"allow_replaced_discard_abilities":  lobby.HouseRules.AllowDiscardAbilities,
-			"auto_start":                        lobby.HouseRules.AutoStart,
-			"turn_timeout_sec":                  lobby.HouseRules.TurnTimeoutSec,
-		},
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	json.NewEncoder(w).Encode(lobby)
 }
 
 // JoinLobbyHandler handles a request by a user to join an existing lobby.

@@ -65,11 +65,11 @@ type CambiaGame struct {
 	ID      uuid.UUID
 	LobbyID uuid.UUID // references the lobby that spawned this game
 
+	HouseRules HouseRules
+
 	Players     []*models.Player
 	Deck        []*models.Card
 	DiscardPile []*models.Card
-
-	HouseRules models.HouseRules
 
 	CurrentPlayerIndex int
 	Started            bool
@@ -110,6 +110,13 @@ func NewCambiaGame() *CambiaGame {
 		CambiaFinalCounter: 0,
 	}
 	g.initializeDeck()
+	return g
+}
+
+func NewCambiaGameFromLobby(ctx context.Context, lobby *Lobby) *CambiaGame {
+	g := NewCambiaGame()
+	g.LobbyID = lobby.ID
+	g.HouseRules = lobby.HouseRules
 	return g
 }
 
@@ -185,8 +192,8 @@ func (g *CambiaGame) Start() {
 	}
 	g.Started = true
 
-	if g.HouseRules.TurnTimeoutSeconds() > 0 {
-		g.TurnDuration = time.Duration(g.HouseRules.TurnTimeoutSeconds()) * time.Second
+	if g.HouseRules.TurnTimerSec > 0 {
+		g.TurnDuration = time.Duration(g.HouseRules.TurnTimerSec) * time.Second
 	} else {
 		g.TurnDuration = 0
 	}
@@ -637,7 +644,7 @@ func (g *CambiaGame) penalizeSnapFail(playerID uuid.UUID, attemptedCard *models.
 			UserID: playerID,
 		})
 	}
-	pen := g.HouseRules.PenaltyCardCount
+	pen := g.HouseRules.PenaltyDrawCount
 	if pen < 1 {
 		pen = 2
 	}
