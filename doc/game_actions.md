@@ -1,3 +1,36 @@
+# Socket command actions
+
+## Game/Turns
+
+The following prefixes are used by server-emitted messages:
+
+| `type` Prefix | Target(s) | Meaning               |
+| ------------- | --------- | --------------------- |
+| `player_*`    | Lobby     | Player made an action |
+| `private_*`   | Player    | Private message       |
+| `game_*`      | Lobby     | Administrative update |
+
+The following prefixes are emitted by clients to the server:
+
+| `type` Prefix | Meaning                        |
+| ------------- | ------------------------------ |
+| `action_*`    | Player wants to make an action |
+
+### Command Summary
+
+| Client Main Actions         | Type String               | Special Action String | Payload | Notes |
+|-----------------------------|---------------------------|-----------------------|---------|-------|
+| Draw card from stockpile    | `action_draw_stockpile`   | n/a                   |         |       |
+| Draw card from discard pile | `action_draw_discardpile` | n/a                   |         |       |
+| Discard drawn card          | `action_discard`          | n/a                   |         |       |
+| Replace card in hand        | `action_replace`          | n/a                   |         |       |
+| 7/8 Peek at self            | `action_special`          | `peek_self`           |         |       |
+| 9/10 Peek at other          | `action_special`          | `peek_other`          |         |       |
+| J/Q Blind swap              | `action_special`          | `blind_swap`          |         |       |
+| K Peek and swap             | `action_special`          | `peek_swap`           |         |       |
+| Call "Cambia"               | `action_special`          | n/a                   |         |       |
+| Snap card                   | `action_snap`             | n/a                   |         |       |
+
 ### Snap Action
 
 Client sent payload:
@@ -88,7 +121,7 @@ After receiving this message, the server handles the action appropriately. If a 
 
 ```json: server -> all clients
 {
-  "type": "reshuffle_stockpile",
+  "type": "game_reshuffle_stockpile",
   "stockpileSize": 30 // where this number is the new size of the stockpile (num cards)
 }
 ```
@@ -479,7 +512,7 @@ Every time someone's turn is over, the server should automatically increment the
 
 ```json: server -> all clients
 {
-  "type": "player_turn",
+  "type": "game_player_turn",
   "user": {
     "id": "{id}"
   }
