@@ -35,24 +35,26 @@ func main() {
 	mux.HandleFunc("/friends/remove", handlers.RemoveFriendHandler)
 
 	// game websocket
-	gameSrv := handlers.NewGameServer()
+	srv := handlers.NewGameServer()
 
 	// lobby manager
 	ls := game.NewLobbyStore()
 
 	mux.Handle("/game/ws/", middleware.LogMiddleware(logger)(http.HandlerFunc(
-		handlers.GameWSHandler(logger, gameSrv),
+		handlers.GameWSHandler(logger, srv),
 	)))
 
 	// lobby endpoints
-	mux.HandleFunc("/lobby/create", handlers.CreateLobbyHandler)
-	mux.HandleFunc("/lobby/list", handlers.ListLobbiesHandler)
-	mux.HandleFunc("/lobby/get", handlers.GetLobbyHandler)
-	mux.HandleFunc("/lobby/delete", handlers.DeleteLobbyHandler)
+	mux.Handle("/lobby/create", middleware.LogMiddleware(logger)(http.HandlerFunc(
+		handlers.CreateLobbyHandler(srv),
+	)))
+	mux.Handle("/lobby/list", middleware.LogMiddleware(logger)(http.HandlerFunc(
+		handlers.ListLobbiesHandler(srv),
+	)))
 
 	// lobby ws
 	mux.Handle("/lobby/ws/", middleware.LogMiddleware(logger)(http.HandlerFunc(
-		handlers.LobbyWSHandler(logger, ls, gameSrv),
+		handlers.LobbyWSHandler(logger, ls, srv),
 	)))
 
 	addr := ":8080"

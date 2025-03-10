@@ -20,19 +20,25 @@ func NewLobbyStore() *LobbyStore {
 	}
 }
 
-// AddLobby adds a new lobby to the store.
-func (s *LobbyStore) AddLobby(lobby *Lobby) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.lobbies[lobby.ID] = lobby
-}
-
 // GetLobby retrieves a lobby from the store by its UUID.
 func (s *LobbyStore) GetLobby(id uuid.UUID) (*Lobby, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	lobby, exists := s.lobbies[id]
 	return lobby, exists
+}
+
+func (s *LobbyStore) GetLobbies() map[uuid.UUID]*Lobby {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lobbies
+}
+
+// AddLobby adds a new lobby to the store.
+func (s *LobbyStore) AddLobby(lobby *Lobby) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lobbies[lobby.ID] = lobby
 }
 
 // DeleteLobby removes a lobby from memory if it exists, e.g. if the lobby is closed or deleted.

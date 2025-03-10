@@ -15,19 +15,19 @@ type Lobby struct {
 	Type       string    `json:"type"`     // one of: "private", "public", "matchmaking"; defaults to "private"; private matches are invite or link only
 	GameMode   string    `json:"gameMode"` // one of: "head_to_head", "group_of_4", "circuit_4p", "circuit_7p8p", "custom"
 
-	Users map[uuid.UUID]bool // false if user is not in the lobby
+	Users map[uuid.UUID]bool `json:"-"` // false if user is not in the lobby
 
-	Connections map[uuid.UUID]*LobbyConnection
-	ReadyStates map[uuid.UUID]bool
+	Connections map[uuid.UUID]*LobbyConnection `json:"-"`
+	ReadyStates map[uuid.UUID]bool             `json:"-"`
 
 	// GmaeInstaceCreated tracks whether a game instance has been initiated
-	GameInstanceCreated bool
-	GameID              uuid.UUID
+	GameInstanceCreated bool      `json:"-"`
+	GameID              uuid.UUID `json:"-"`
 
 	// InGame indicates whether a game is currently active. If so, we might block further starts.
-	InGame bool
+	InGame bool `json:"inGame"`
 
-	CountdownTimer *time.Timer
+	CountdownTimer *time.Timer `json:"-"`
 
 	HouseRules    HouseRules    `json:"houseRules"`
 	Circuit       Circuit       `json:"circuit"`
