@@ -31,14 +31,6 @@ var (
 	}
 )
 
-// GlobalGameServer is the global instance that can be set by InitLobbyHandlers, if desired.
-var GlobalGameServer *GameServer
-
-// InitLobbyHandlers sets a global game server for lobby handling.
-func InitLobbyHandlers(gs *GameServer) {
-	GlobalGameServer = gs
-}
-
 // CreateLobbyHandler handles the creation of a new lobby and adds it to the lobby store
 func CreateLobbyHandler(w http.ResponseWriter, r *http.Request) {
 	cookie := r.Header.Get("Cookie")

@@ -23,7 +23,7 @@ const (
 	EventSnapSuccess      GameEventType = "player_snap_success"
 	EventSnapFail         GameEventType = "player_snap_fail"
 	EventSnapPenalty      GameEventType = "player_snap_penalty"
-	EventReshuffle        GameEventType = "reshuffle_stockpile"
+	EventReshuffle        GameEventType = "game_reshuffle_stockpile"
 	EventPlayerDrawStock  GameEventType = "player_draw_stockpile"
 	EventPrivateDrawStock GameEventType = "private_draw_stockpile"
 	EventPlayerDiscard    GameEventType = "player_discard"
@@ -77,7 +77,10 @@ type CambiaGame struct {
 
 	lastSeen     map[uuid.UUID]time.Time
 	turnTimer    *time.Timer
+	TurnID       int
 	TurnDuration time.Duration
+
+	Actions []models.GameAction
 
 	OnGameEnd   OnGameEndFunc
 	BroadcastFn func(ev GameEvent) // callback to broadcast game events
@@ -95,12 +98,13 @@ type CambiaGame struct {
 
 // NewCambiaGame builds an empty instance with a newly shuffled deck.
 func NewCambiaGame() *CambiaGame {
-	id, _ := uuid.NewRandom()
+	id, _ := uuid.NewV7()
 	g := &CambiaGame{
 		ID:                 id,
 		Deck:               []*models.Card{},
 		DiscardPile:        []*models.Card{},
 		lastSeen:           make(map[uuid.UUID]time.Time),
+		TurnID:             0,
 		CurrentPlayerIndex: 0,
 		Started:            false,
 		GameOver:           false,

@@ -3,6 +3,7 @@ package game
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -13,6 +14,8 @@ type Lobby struct {
 	HostUserID uuid.UUID `json:"hostUserID"`
 	Type       string    `json:"type"`     // one of: "private", "public", "matchmaking"; defaults to "private"; private matches are invite or link only
 	GameMode   string    `json:"gameMode"` // one of: "head_to_head", "group_of_4", "circuit_4p", "circuit_7p8p", "custom"
+
+	Users map[uuid.UUID]bool // false if user is not in the lobby
 
 	Connections map[uuid.UUID]*LobbyConnection
 	ReadyStates map[uuid.UUID]bool
@@ -36,16 +39,26 @@ type LobbyConnection struct {
 	UserID  uuid.UUID
 	Cancel  context.CancelFunc
 	OutChan chan map[string]interface{}
+	IsHost  bool
 }
 
-type HouseRules struct {
-	AllowDrawFromDiscardPile bool `json:"allowDrawFromDiscardPile"` // allow players to draw from the discard pile
-	AllowReplaceAbilities    bool `json:"allowReplaceAbilities"`    // allow cards discarded from a draw and replace to use their special abilities
-	SnapRace                 bool `json:"snapRace"`                 // only allow the first card snapped to succeed; all others get penalized
-	ForfeitOnDisconnect      bool `json:"forfeitOnDisconnect"`      // if a player disconnects, forfeit their game; if false, players can rejoin
-	PenaltyDrawCount         int  `json:"penaltyDrawCount"`         // num cards to draw on false snap
-	AutoKickTurnCount        int  `json:"autoKickTurnCount"`        // number of Cambia rounds to wait before auto-forfeiting a player that is nonresponsive
-	TurnTimerSec             int  `json:"turnTimerSec"`             // number of seconds to wait for a player to make a move; default is 15 sec
+// Write will push a message to the user's message channel.
+func (conn *LobbyConnection) Write(msg map[string]interface{}) {
+	conn.OutChan <- msg
+}
+
+// WriteError will push an error message to the user's message channel.
+// The structure is as follows:
+//
+//	{
+//	 "type": "error",
+//	 "message": msg
+//	}
+func (conn *LobbyConnection) WriteError(msg string) {
+	conn.OutChan <- map[string]interface{}{
+		"type":    "error",
+		"message": msg,
+	}
 }
 
 type Circuit struct {
@@ -77,7 +90,12 @@ type LobbySettings struct {
 // - `AutoKickTurnCount`: `3`
 // - `TurnTimerSec`: `15`
 //
-// Returns a pointer to the lobby
+// Additionally, `autoStart` is enabled by default.
+//
+// Note that the Lobby struct contains a map of Connection pools in order to communicate
+// with connected users via websockets. If you are using the Game/Lobby API internally or
+// under your own implementation, you can leave the connections map empty and manage
+// your communications on your own.
 func NewLobbyWithDefaults(hostID uuid.UUID) *Lobby {
 	var (
 		defaultHouseRules = HouseRules{
@@ -159,6 +177,33 @@ func NewLobbyWithSettings(hostID uuid.UUID, houseRules HouseRules, circuit Circu
 	}
 }
 
+// InviteUser grants "permission" to a user to join this lobby. This only has an effect if the Type is "private".
+func (lobby *Lobby) InviteUser(userID uuid.UUID) {
+	lobby.Users[userID] = false
+}
+
+// AddConnection registers a user's connection to the lobby and sets their ready status.
+// This is effectively a "join lobby" operation.
+func (lobby *Lobby) AddConnection(userID uuid.UUID, conn *LobbyConnection) error {
+	if lobby.Type == "private" {
+		if _, ok := lobby.Users[userID]; !ok {
+			// user not invited
+			return fmt.Errorf("user %s not invited to the private lobby", userID)
+		}
+	}
+
+	lobby.Users[userID] = true
+	lobby.Connections[userID] = conn
+	lobby.ReadyStates[userID] = false
+
+	return nil
+}
+
+// JoinUser is an alias for AddConnection
+func (lobby *Lobby) JoinUser(userID uuid.UUID, conn *LobbyConnection) error {
+	return lobby.AddConnection(userID, conn)
+}
+
 // StartCountdown initiates a countdown if not already counting down, referencing Rules.AutoStart.
 //
 // seconds is how long the countdown lasts. After it finishes, we call OnCountdownFinish, if set.
@@ -170,6 +215,11 @@ func (lobby *Lobby) StartCountdown(seconds int, callback func(uuid.UUID)) bool {
 	if lobby.CountdownTimer != nil {
 		return false
 	}
+
+	lobby.BroadcastAll(map[string]interface{}{
+		"type":    "lobby_countdown_start",
+		"seconds": seconds,
+	})
 
 	lobby.CountdownTimer = time.AfterFunc(time.Duration(seconds)*time.Second, func() {
 		callback(lobby.ID)
@@ -220,9 +270,24 @@ func (lobby *Lobby) AreAllReady() bool {
 	return true
 }
 
-// BroadcastCustom sends a custom message to all in the lobby
-func (lobby *Lobby) BroadcastCustom(msg map[string]interface{}) {
-	lobby.BroadcastAll(msg)
+func (lobby *Lobby) WhoIsReady() []uuid.UUID {
+	var readyUsers []uuid.UUID
+	for userID, ready := range lobby.ReadyStates {
+		if ready {
+			readyUsers = append(readyUsers, userID)
+		}
+	}
+	return readyUsers
+}
+
+func (lobby *Lobby) WhoIsNotReady() []uuid.UUID {
+	var notReadyUsers []uuid.UUID
+	for userID, ready := range lobby.ReadyStates {
+		if !ready {
+			notReadyUsers = append(notReadyUsers, userID)
+		}
+	}
+	return notReadyUsers
 }
 
 // BroadcastAll sends a JSON object to all connected users' OutChan.
@@ -272,6 +337,7 @@ func (lobby *Lobby) BroadcastChat(userID uuid.UUID, msg string) {
 // RemoveUser removes a user from Connections & ReadyStates (if the user
 // unexpectedly disconnects). It's used in readPump's defer if we see an error or close.
 func (lobby *Lobby) RemoveUser(userID uuid.UUID) {
+	delete(lobby.Users, userID)
 	delete(lobby.Connections, userID)
 	delete(lobby.ReadyStates, userID)
 

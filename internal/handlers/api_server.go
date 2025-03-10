@@ -58,8 +58,8 @@ func (gs *GameServer) NewCambiaGameFromLobby(ctx context.Context, lobby *game.Lo
 		for pid, sc := range scores {
 			resultMsg["scores"].(map[string]int)[pid.String()] = sc
 		}
-		ls.BroadcastChat(winner, fmt.Sprintf("Game ended, winner is %v", winner))
-		ls.BroadcastCustom(resultMsg)
+		lobby.BroadcastChat(winner, fmt.Sprintf("Game ended, winner is %v", winner))
+		lobby.BroadcastAll(resultMsg)
 	}
 
 	gs.GameStore.AddGame(g)
