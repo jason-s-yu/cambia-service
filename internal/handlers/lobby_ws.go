@@ -35,7 +35,7 @@ var GameServerForLobbyWS *GameServer
 //
 // Returns:
 // - An http.HandlerFunc that handles the WebSocket connection.
-func LobbyWSHandler(logger *logrus.Logger, ls *game.LobbyStore, gs *GameServer) http.HandlerFunc {
+func LobbyWSHandler(logger *logrus.Logger, gs *GameServer) http.HandlerFunc {
 	GameServerForLobbyWS = gs
 	return func(w http.ResponseWriter, r *http.Request) {
 		pathParts := strings.Split(strings.TrimPrefix(r.URL.Path, "/lobby/ws/"), "/")
@@ -54,12 +54,13 @@ func LobbyWSHandler(logger *logrus.Logger, ls *game.LobbyStore, gs *GameServer) 
 			Subprotocols:   []string{"lobby"},
 			OriginPatterns: []string{"*"},
 		})
+
 		if err != nil {
 			logger.Warnf("websocket accept error: %v", err)
 			return
 		}
 		if c.Subprotocol() != "lobby" {
-			c.Close(websocket.StatusPolicyViolation, "client must speak the lobby subprotocol")
+			c.Close(BadSubprotocolError, "client must speak the lobby subprotocol")
 			return
 		}
 
@@ -67,18 +68,17 @@ func LobbyWSHandler(logger *logrus.Logger, ls *game.LobbyStore, gs *GameServer) 
 		userIDStr, err := auth.AuthenticateJWT(token)
 		if err != nil {
 			logger.Warnf("invalid token: %v", err)
-			c.Close(websocket.StatusPolicyViolation, "invalid auth_token")
+			c.Close(InvalidAuthTokenError, "invalid auth_token")
 			return
 		}
 		userUUID, err := uuid.Parse(userIDStr)
 		if err != nil {
 			logger.Warnf("invalid userID parse: %v", err)
-			c.Close(websocket.StatusPolicyViolation, "invalid user ID")
+			c.Close(InvalidUserIDError, "invalid user ID")
 			return
 		}
 
-		if lobby, exists := ls.GetLobby(lobbyUUID); exists {
-
+		if lobby, exists := gs.LobbyStore.GetLobby(lobbyUUID); exists {
 			ctx, cancel := context.WithCancel(r.Context())
 			conn := &game.LobbyConnection{
 				UserID:  userUUID,
@@ -102,7 +102,7 @@ func LobbyWSHandler(logger *logrus.Logger, ls *game.LobbyStore, gs *GameServer) 
 			lobby.BroadcastJoin(userUUID)
 			readPump(ctx, c, lobby, conn, logger, lobbyUUID)
 		} else {
-			c.Close(websocket.StatusPolicyViolation, "lobby does not exist")
+			c.Close(InvalidLobbyIDError, "lobby does not exist")
 			return
 		}
 	}
@@ -132,12 +132,12 @@ func readPump(ctx context.Context, c *websocket.Conn, lobby *game.Lobby, conn *g
 			continue
 		}
 
-		handleLobbyMessage(packet, lobby, conn, logger, lobbyID)
+		handleLobbyMessage(packet, lobby, conn, logger)
 	}
 }
 
 // handleLobbyMessage interprets the "type" field received by client and updates the lobby or broadcasts accordingly.
-func handleLobbyMessage(packet map[string]interface{}, lobby *game.Lobby, senderConn *game.LobbyConnection, logger *logrus.Logger, lobbyID uuid.UUID) {
+func handleLobbyMessage(packet map[string]interface{}, lobby *game.Lobby, senderConn *game.LobbyConnection, logger *logrus.Logger) {
 	action, _ := packet["type"].(string)
 	switch action {
 	case "ready":
@@ -147,8 +147,12 @@ func handleLobbyMessage(packet map[string]interface{}, lobby *game.Lobby, sender
 			// TODO: create and attach the game instance now
 
 			// check for auto start
-			lobby.StartCountdown(10, func(lobbyID uuid.UUID) {
-				GameServerForLobbyWS.NewCambiaGameFromLobby(context.Background(), lobby)
+			lobby.StartCountdown(10, func(lobby *game.Lobby) {
+				g := GameServerForLobbyWS.NewCambiaGameFromLobby(context.Background(), lobby)
+
+				lobby.BroadcastAll(map[string]interface{}{
+					"game_id": g.ID.String(),
+				})
 			})
 		}
 	case "unready":

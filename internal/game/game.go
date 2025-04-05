@@ -121,6 +121,18 @@ func NewCambiaGameFromLobby(ctx context.Context, lobby *Lobby) *CambiaGame {
 	g := NewCambiaGame()
 	g.LobbyID = lobby.ID
 	g.HouseRules = lobby.HouseRules
+
+	// create players from lobby users
+	for _, user := range lobby.Users {
+		g.Players = append(g.Players, &models.Player{
+			ID:        user.ID,
+			Hand:      []*models.Card{},
+			Connected: false,
+			Conn:      nil,
+			User:      user,
+		})
+	}
+
 	return g
 }
 

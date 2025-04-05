@@ -26,7 +26,7 @@ func LogMiddleware(logger *logrus.Logger) func(next http.Handler) http.Handler {
 				"path":     path,
 				"duration": duration,
 				"remote":   r.RemoteAddr,
-			}).Info("HTTP Request")
+			}).Info()
 		})
 	}
 }

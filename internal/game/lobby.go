@@ -114,10 +114,19 @@ func NewLobbyWithDefaults(hostID uuid.UUID) *Lobby {
 	lobbyID, _ := uuid.NewV7()
 
 	return &Lobby{
-		ID:            lobbyID,
-		HostUserID:    hostID,
-		Connections:   make(map[uuid.UUID]*LobbyConnection),
-		ReadyStates:   make(map[uuid.UUID]bool),
+		ID:          lobbyID,
+		HostUserID:  hostID,
+		Type:        "private",
+		GameMode:    "head_to_head",
+		Users:       make(map[uuid.UUID]bool),
+		Connections: make(map[uuid.UUID]*LobbyConnection),
+		ReadyStates: make(map[uuid.UUID]bool),
+
+		GameInstanceCreated: false,
+		GameID:              uuid.Nil,
+		InGame:              false,
+		CountdownTimer:      nil,
+
 		HouseRules:    defaultHouseRules,
 		Circuit:       defaultCircuitSettings,
 		LobbySettings: defaultLobbySettings,
@@ -153,10 +162,19 @@ func NewCircuitWithDefaults(hostID uuid.UUID) *Lobby {
 	lobbyID, _ := uuid.NewV7()
 
 	return &Lobby{
-		ID:            lobbyID,
-		HostUserID:    hostID,
-		Connections:   make(map[uuid.UUID]*LobbyConnection),
-		ReadyStates:   make(map[uuid.UUID]bool),
+		ID:          lobbyID,
+		HostUserID:  hostID,
+		Type:        "private",
+		GameMode:    "circuit_4p",
+		Users:       make(map[uuid.UUID]bool),
+		Connections: make(map[uuid.UUID]*LobbyConnection),
+		ReadyStates: make(map[uuid.UUID]bool),
+
+		GameInstanceCreated: false,
+		GameID:              uuid.Nil,
+		InGame:              false,
+		CountdownTimer:      nil,
+
 		HouseRules:    defaultHouseRules,
 		Circuit:       defaultCircuitSettings,
 		LobbySettings: defaultLobbySettings,
@@ -207,7 +225,7 @@ func (lobby *Lobby) JoinUser(userID uuid.UUID, conn *LobbyConnection) error {
 // StartCountdown initiates a countdown if not already counting down, referencing Rules.AutoStart.
 //
 // seconds is how long the countdown lasts. After it finishes, we call OnCountdownFinish, if set.
-func (lobby *Lobby) StartCountdown(seconds int, callback func(uuid.UUID)) bool {
+func (lobby *Lobby) StartCountdown(seconds int, callback func(*Lobby)) bool {
 	// If already in a game or countdown is running, do nothing
 	if lobby.InGame {
 		return false
@@ -222,7 +240,7 @@ func (lobby *Lobby) StartCountdown(seconds int, callback func(uuid.UUID)) bool {
 	})
 
 	lobby.CountdownTimer = time.AfterFunc(time.Duration(seconds)*time.Second, func() {
-		callback(lobby.ID)
+		callback(lobby)
 	})
 
 	return true

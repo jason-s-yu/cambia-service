@@ -40,3 +40,34 @@ func ConnectDB() {
 
 	log.Printf("Connected to database at %s", connStr)
 }
+
+// ConnectDBAsync continuously attempts to establish and maintain a database connection.
+func ConnectDBAsync() {
+	for {
+		log.Println("Attempting to connect to database...")
+		var err error
+		for {
+			ConnectDB()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err = DB.Ping(ctx)
+			cancel()
+			if err == nil {
+				break
+			}
+			log.Printf("Unable to connect to DB: %v. Retrying in 10 seconds.", err)
+			time.Sleep(time.Second * 10)
+		}
+
+		// Once connected, periodically check the connection.
+		for {
+			time.Sleep(time.Minute)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := DB.Ping(ctx)
+			cancel()
+			if err != nil {
+				log.Printf("Lost DB connection: %v. Reconnecting...", err)
+				break // exit inner loop to reconnect
+			}
+		}
+	}
+}

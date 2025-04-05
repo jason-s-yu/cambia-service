@@ -29,7 +29,7 @@ var (
 // CreateLobbyHandler handles the creation of a new lobby and adds it to the lobby store
 func CreateLobbyHandler(gs *GameServer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		cookie := r.Header.Get("Coo kie")
+		cookie := r.Header.Get("Cookie")
 		if !strings.Contains(cookie, "auth_token=") {
 			http.Error(w, "missing auth_token", http.StatusUnauthorized)
 			return

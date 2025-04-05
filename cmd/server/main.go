@@ -8,7 +8,6 @@ import (
 
 	"github.com/jason-s-yu/cambia/internal/auth"
 	"github.com/jason-s-yu/cambia/internal/database"
-	"github.com/jason-s-yu/cambia/internal/game"
 	"github.com/jason-s-yu/cambia/internal/handlers"
 	"github.com/jason-s-yu/cambia/internal/middleware"
 	_ "github.com/joho/godotenv/autoload"
@@ -17,7 +16,8 @@ import (
 
 func main() {
 	auth.Init()
-	database.ConnectDB()
+	// database.ConnectDB()
+	go database.ConnectDBAsync()
 
 	logger := logrus.New()
 	logger.SetLevel(logrus.DebugLevel)
@@ -37,9 +37,6 @@ func main() {
 	// game websocket
 	srv := handlers.NewGameServer()
 
-	// lobby manager
-	ls := game.NewLobbyStore()
-
 	mux.Handle("/game/ws/", middleware.LogMiddleware(logger)(http.HandlerFunc(
 		handlers.GameWSHandler(logger, srv),
 	)))
@@ -54,7 +51,7 @@ func main() {
 
 	// lobby ws
 	mux.Handle("/lobby/ws/", middleware.LogMiddleware(logger)(http.HandlerFunc(
-		handlers.LobbyWSHandler(logger, ls, srv),
+		handlers.LobbyWSHandler(logger, srv),
 	)))
 
 	addr := ":8080"
