@@ -194,9 +194,7 @@ func parseUserIDFromCard(c map[string]interface{}) uuid.UUID {
 	return uid
 }
 
-// pickCardFromMessage and swapTwoCards are identical to your original logic
-// but we've placed them here so we can call them from doSwapBlind/doKingFirstStep/etc.
-
+// pickCardFromMessage finds a card based on ID and returns it, for a swap action.
 func pickCardFromMessage(g *CambiaGame, cardMap map[string]interface{}) (*models.Card, uuid.UUID) {
 	if cardMap == nil {
 		return nil, uuid.Nil
