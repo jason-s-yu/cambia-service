@@ -1,3 +1,4 @@
+// internal/game/lobby_store.go
 package game
 
 import (
@@ -6,45 +7,44 @@ import (
 	"github.com/google/uuid"
 )
 
-// LobbyStore manages all active lobbies in memory. Each lobby is tracked
-// by a Lobby, keyed by the lobby's UUID.
+// LobbyStore manages ephemeral lobbies in memory only.
 type LobbyStore struct {
 	mu      sync.Mutex
 	lobbies map[uuid.UUID]*Lobby
 }
 
-// NewLobbyStore creates and returns a new LobbyStore.
+// NewLobbyStore returns an in-memory store for Lobbies.
 func NewLobbyStore() *LobbyStore {
 	return &LobbyStore{
 		lobbies: make(map[uuid.UUID]*Lobby),
 	}
 }
 
-// GetLobby retrieves a lobby from the store by its UUID.
-func (s *LobbyStore) GetLobby(id uuid.UUID) (*Lobby, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	lobby, exists := s.lobbies[id]
-	return lobby, exists
-}
-
-func (s *LobbyStore) GetLobbies() map[uuid.UUID]*Lobby {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.lobbies
-}
-
-// AddLobby adds a new lobby to the store.
+// AddLobby stores the lobby in memory. Typically you also define OnEmpty so that the lobby can remove itself.
 func (s *LobbyStore) AddLobby(lobby *Lobby) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.lobbies[lobby.ID] = lobby
 }
 
-// DeleteLobby removes a lobby from memory if it exists, e.g. if the lobby is closed or deleted.
-// This function should be automatically called once the last user leaves a lobby.
+// DeleteLobby removes the ephemeral lobby from memory.
 func (s *LobbyStore) DeleteLobby(id uuid.UUID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.lobbies, id)
+}
+
+// GetLobby retrieves a lobby if it exists.
+func (s *LobbyStore) GetLobby(id uuid.UUID) (*Lobby, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l, ok := s.lobbies[id]
+	return l, ok
+}
+
+// GetLobbies returns the entire map, typically for debugging or listing.
+func (s *LobbyStore) GetLobbies() map[uuid.UUID]*Lobby {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lobbies
 }

@@ -1,59 +1,58 @@
-// internal/game/lobby_manager.go
+// internal/game/lobby.go
 package game
 
 import (
-	"context"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 )
 
+// Lobby is an ephemeral grouping of users with chat, rules, ready states, etc.
 type Lobby struct {
 	ID         uuid.UUID `json:"id"`
 	HostUserID uuid.UUID `json:"hostUserID"`
-	Type       string    `json:"type"`     // one of: "private", "public", "matchmaking"; defaults to "private"; private matches are invite or link only
-	GameMode   string    `json:"gameMode"` // one of: "head_to_head", "group_of_4", "circuit_4p", "circuit_7p8p", "custom"
+	Type       string    `json:"type"`
+	GameMode   string    `json:"gameMode"`
 
-	Users map[uuid.UUID]bool `json:"-"` // false if user is not in the lobby
+	// Users maps userID -> whether they've joined (true) or only invited (false).
+	Users map[uuid.UUID]bool `json:"-"`
 
+	// Connections holds the actual live WebSocket connections for joined users.
 	Connections map[uuid.UUID]*LobbyConnection `json:"-"`
-	ReadyStates map[uuid.UUID]bool             `json:"-"`
+	// ReadyStates holds userID -> bool for "is ready".
+	ReadyStates map[uuid.UUID]bool `json:"-"`
 
-	// GmaeInstaceCreated tracks whether a game instance has been initiated
 	GameInstanceCreated bool      `json:"-"`
 	GameID              uuid.UUID `json:"-"`
-
-	// InGame indicates whether a game is currently active. If so, we might block further starts.
-	InGame bool `json:"inGame"`
+	InGame              bool      `json:"inGame"`
 
 	CountdownTimer *time.Timer `json:"-"`
 
 	HouseRules    HouseRules    `json:"houseRules"`
 	Circuit       Circuit       `json:"circuit"`
 	LobbySettings LobbySettings `json:"lobbySettings"`
+
+	// OnEmpty is called if we detect the lobby is empty (0 users) after removing a user.
+	// Typically assigned by the code that creates & stores this lobby, e.g. via
+	//   lobby.OnEmpty = func(lobbyID uuid.UUID) { store.DeleteLobby(lobbyID) }
+	OnEmpty func(lobbyID uuid.UUID) `json:"-"`
 }
 
-// LobbyConnection wraps a single user's active WebSocket connection for the lobby.
+// LobbyConnection is a single user's presence in the lobby.
 type LobbyConnection struct {
 	UserID  uuid.UUID
-	Cancel  context.CancelFunc
+	Cancel  func()
 	OutChan chan map[string]interface{}
 	IsHost  bool
 }
 
-// Write will push a message to the user's message channel.
+// Write pushes a message onto the user's OutChan.
 func (conn *LobbyConnection) Write(msg map[string]interface{}) {
 	conn.OutChan <- msg
 }
 
-// WriteError will push an error message to the user's message channel.
-// The structure is as follows:
-//
-//	{
-//	 "type": "error",
-//	 "message": msg
-//	}
+// WriteError is a convenience to send an error object.
 func (conn *LobbyConnection) WriteError(msg string) {
 	conn.OutChan <- map[string]interface{}{
 		"type":    "error",
@@ -61,58 +60,36 @@ func (conn *LobbyConnection) WriteError(msg string) {
 	}
 }
 
+// Circuit and HouseRules are still present but not fully used yet.
 type Circuit struct {
-	Enabled bool         `json:"enabled"` // whether to enable Circuit mode
-	Mode    string       `json:"mode"`    // one of: "elimination", "max_rounds"
+	Enabled bool         `json:"enabled"`
+	Mode    string       `json:"mode"`
 	Rules   CircuitRules `json:"rules"`
 }
 
 type CircuitRules struct {
-	TargetScore            int  `json:"target_score"`           // the target score for either elimination or first_to_score; players who reach this are either eliminated or win, respectively
-	WinBonus               int  `json:"winBonus"`               // constant added to the winner's running score if they win
-	FalseCambiaPenalty     int  `json:"falseCambiaPenalty"`     // penalty for a player who calls Cambia but doesn't win
-	FreezeUserOnDisconnect bool `json:"freezeUserOnDisconnect"` // if true, freeze the user's score on disconnect and keep them out of the rounds; they can rejoin
+	TargetScore            int  `json:"target_score"`
+	WinBonus               int  `json:"winBonus"`
+	FalseCambiaPenalty     int  `json:"falseCambiaPenalty"`
+	FreezeUserOnDisconnect bool `json:"freezeUserOnDisconnect"`
 }
 
 type LobbySettings struct {
-	AutoStart bool `json:"autoStart"` // default true
+	AutoStart bool `json:"autoStart"`
 }
 
-// NewLobby creates a new non-circuit Lobby under the specified host user.
-//
-// Default game settings (HouseRules) are applied:
-//
-// - `AllowDrawFromDiscardPile“: `false“
-// - `AllowReplaceAbilities`: `false`
-// - `SnapRace`: `false`
-// - `ForfeitOnDisconnect`: `true`
-// - `PenaltyDrawCount`: `1`
-// - `AutoKickTurnCount`: `3`
-// - `TurnTimerSec`: `15`
-//
-// Additionally, `autoStart` is enabled by default.
-//
-// Note that the Lobby struct contains a map of Connection pools in order to communicate
-// with connected users via websockets. If you are using the Game/Lobby API internally or
-// under your own implementation, you can leave the connections map empty and manage
-// your communications on your own.
+// NewLobbyWithDefaults creates an ephemeral lobby with default house rules, etc.
 func NewLobbyWithDefaults(hostID uuid.UUID) *Lobby {
-	var (
-		defaultHouseRules = HouseRules{
-			AllowDrawFromDiscardPile: false,
-			AllowReplaceAbilities:    false,
-			SnapRace:                 false,
-			ForfeitOnDisconnect:      true,
-			PenaltyDrawCount:         1,
-			AutoKickTurnCount:        3,
-			TurnTimerSec:             15,
-		}
-		defaultCircuitSettings = Circuit{Enabled: false}
-		defaultLobbySettings   = LobbySettings{AutoStart: true}
-	)
-
-	lobbyID, _ := uuid.NewV7()
-
+	lobbyID, _ := uuid.NewRandom()
+	defaultHouseRules := HouseRules{
+		AllowDrawFromDiscardPile: false,
+		AllowReplaceAbilities:    false,
+		SnapRace:                 false,
+		ForfeitOnDisconnect:      true,
+		PenaltyDrawCount:         1,
+		AutoKickTurnCount:        3,
+		TurnTimerSec:             15,
+	}
 	return &Lobby{
 		ID:          lobbyID,
 		HostUserID:  hostID,
@@ -122,115 +99,50 @@ func NewLobbyWithDefaults(hostID uuid.UUID) *Lobby {
 		Connections: make(map[uuid.UUID]*LobbyConnection),
 		ReadyStates: make(map[uuid.UUID]bool),
 
-		GameInstanceCreated: false,
-		GameID:              uuid.Nil,
-		InGame:              false,
-		CountdownTimer:      nil,
-
-		HouseRules:    defaultHouseRules,
-		Circuit:       defaultCircuitSettings,
-		LobbySettings: defaultLobbySettings,
+		HouseRules: defaultHouseRules,
+		Circuit: Circuit{
+			Enabled: false,
+		},
+		LobbySettings: LobbySettings{
+			AutoStart: true,
+		},
 	}
 }
 
-// NewLobby creates a new Lobby under the specified host user.
-// Returns a pointer to the lobby
-func NewCircuitWithDefaults(hostID uuid.UUID) *Lobby {
-	var (
-		defaultHouseRules = HouseRules{
-			AllowDrawFromDiscardPile: true,
-			PenaltyDrawCount:         1,
-			AllowReplaceAbilities:    true,
-			SnapRace:                 true,
-			ForfeitOnDisconnect:      true,
-			AutoKickTurnCount:        3,
-			TurnTimerSec:             15,
-		}
-		defaultCircuitSettings = Circuit{
-			Enabled: true,
-			Mode:    "elimination",
-			Rules: CircuitRules{
-				TargetScore:            100,
-				WinBonus:               -1,
-				FalseCambiaPenalty:     5,
-				FreezeUserOnDisconnect: false, // i.e. user is automatically eliminated
-			},
-		}
-		defaultLobbySettings = LobbySettings{AutoStart: true}
-	)
-
-	lobbyID, _ := uuid.NewV7()
-
-	return &Lobby{
-		ID:          lobbyID,
-		HostUserID:  hostID,
-		Type:        "private",
-		GameMode:    "circuit_4p",
-		Users:       make(map[uuid.UUID]bool),
-		Connections: make(map[uuid.UUID]*LobbyConnection),
-		ReadyStates: make(map[uuid.UUID]bool),
-
-		GameInstanceCreated: false,
-		GameID:              uuid.Nil,
-		InGame:              false,
-		CountdownTimer:      nil,
-
-		HouseRules:    defaultHouseRules,
-		Circuit:       defaultCircuitSettings,
-		LobbySettings: defaultLobbySettings,
-	}
-}
-
-func NewLobbyWithSettings(hostID uuid.UUID, houseRules HouseRules, circuit Circuit, lobbySettings LobbySettings) *Lobby {
-	lobbyID, _ := uuid.NewV7()
-
-	return &Lobby{
-		ID:            lobbyID,
-		HostUserID:    hostID,
-		Connections:   make(map[uuid.UUID]*LobbyConnection),
-		ReadyStates:   make(map[uuid.UUID]bool),
-		HouseRules:    houseRules,
-		Circuit:       circuit,
-		LobbySettings: lobbySettings,
-	}
-}
-
-// InviteUser grants "permission" to a user to join this lobby. This only has an effect if the Type is "private".
+// InviteUser ephemeral sets userID => false in the Users map (private-lobby invitation).
 func (lobby *Lobby) InviteUser(userID uuid.UUID) {
 	lobby.Users[userID] = false
 }
 
-// AddConnection registers a user's connection to the lobby and sets their ready status.
-// This is effectively a "join lobby" operation.
+// AddConnection ephemeral sets user as "connected," also sets ReadyStates[userID] = false.
 func (lobby *Lobby) AddConnection(userID uuid.UUID, conn *LobbyConnection) error {
 	if lobby.Type == "private" {
 		if _, ok := lobby.Users[userID]; !ok {
-			// user not invited
 			return fmt.Errorf("user %s not invited to the private lobby", userID)
 		}
 	}
-
 	lobby.Users[userID] = true
 	lobby.Connections[userID] = conn
 	lobby.ReadyStates[userID] = false
-
 	return nil
 }
 
-// JoinUser is an alias for AddConnection
-func (lobby *Lobby) JoinUser(userID uuid.UUID, conn *LobbyConnection) error {
-	return lobby.AddConnection(userID, conn)
+// RemoveUser ephemeral: remove from Users, Connections, ReadyStates. If empty => call OnEmpty callback.
+func (lobby *Lobby) RemoveUser(userID uuid.UUID) {
+	delete(lobby.Users, userID)
+	delete(lobby.Connections, userID)
+	delete(lobby.ReadyStates, userID)
+
+	lobby.CancelCountdown()
+
+	if len(lobby.Users) == 0 && lobby.OnEmpty != nil {
+		lobby.OnEmpty(lobby.ID)
+	}
 }
 
-// StartCountdown initiates a countdown if not already counting down, referencing Rules.AutoStart.
-//
-// seconds is how long the countdown lasts. After it finishes, we call OnCountdownFinish, if set.
+// StartCountdown begins a countdown if not in a game, not already counting down.
 func (lobby *Lobby) StartCountdown(seconds int, callback func(*Lobby)) bool {
-	// If already in a game or countdown is running, do nothing
-	if lobby.InGame {
-		return false
-	}
-	if lobby.CountdownTimer != nil {
+	if lobby.InGame || lobby.CountdownTimer != nil {
 		return false
 	}
 
@@ -238,15 +150,13 @@ func (lobby *Lobby) StartCountdown(seconds int, callback func(*Lobby)) bool {
 		"type":    "lobby_countdown_start",
 		"seconds": seconds,
 	})
-
 	lobby.CountdownTimer = time.AfterFunc(time.Duration(seconds)*time.Second, func() {
 		callback(lobby)
 	})
-
 	return true
 }
 
-// CancelCountdown stops an active countdown if present.
+// CancelCountdown stops any existing countdown.
 func (lobby *Lobby) CancelCountdown() {
 	if lobby.CountdownTimer != nil {
 		lobby.CountdownTimer.Stop()
@@ -254,20 +164,18 @@ func (lobby *Lobby) CancelCountdown() {
 	}
 }
 
-// MarkUserReady sets a user's ready state if they're connected.
+// MarkUserReady ephemeral sets a user's ready state to true, then broadcasts.
 func (lobby *Lobby) MarkUserReady(userID uuid.UUID) {
 	if _, ok := lobby.Connections[userID]; !ok {
-		// user not truly connected
 		return
 	}
 	lobby.ReadyStates[userID] = true
 	lobby.BroadcastReadyState(userID, true)
 }
 
-// MarkUserUnready unsets a user's ready state, then cancels the countdown if any.
+// MarkUserUnready ephemeral sets a user's ready state to false, then cancels countdown.
 func (lobby *Lobby) MarkUserUnready(userID uuid.UUID) {
 	if _, ok := lobby.Connections[userID]; !ok {
-		// user not truly connected
 		return
 	}
 	lobby.ReadyStates[userID] = false
@@ -275,7 +183,7 @@ func (lobby *Lobby) MarkUserUnready(userID uuid.UUID) {
 	lobby.CancelCountdown()
 }
 
-// AreAllReady returns true if all known participants are ready.
+// AreAllReady returns true if all *connected* users are ready. If no users, returns false.
 func (lobby *Lobby) AreAllReady() bool {
 	if len(lobby.ReadyStates) == 0 {
 		return false
@@ -288,34 +196,14 @@ func (lobby *Lobby) AreAllReady() bool {
 	return true
 }
 
-func (lobby *Lobby) WhoIsReady() []uuid.UUID {
-	var readyUsers []uuid.UUID
-	for userID, ready := range lobby.ReadyStates {
-		if ready {
-			readyUsers = append(readyUsers, userID)
-		}
-	}
-	return readyUsers
-}
-
-func (lobby *Lobby) WhoIsNotReady() []uuid.UUID {
-	var notReadyUsers []uuid.UUID
-	for userID, ready := range lobby.ReadyStates {
-		if !ready {
-			notReadyUsers = append(notReadyUsers, userID)
-		}
-	}
-	return notReadyUsers
-}
-
-// BroadcastAll sends a JSON object to all connected users' OutChan.
+// BroadcastAll sends msg to every connected user in this lobby.
 func (lobby *Lobby) BroadcastAll(msg map[string]interface{}) {
 	for _, conn := range lobby.Connections {
 		conn.OutChan <- msg
 	}
 }
 
-// BroadcastJoin sends a "lobby_update" message indicating a user joined.
+// BroadcastJoin notifies that a user joined.
 func (lobby *Lobby) BroadcastJoin(userID uuid.UUID) {
 	lobby.BroadcastAll(map[string]interface{}{
 		"type":      "lobby_update",
@@ -324,7 +212,7 @@ func (lobby *Lobby) BroadcastJoin(userID uuid.UUID) {
 	})
 }
 
-// BroadcastReadyState sends an update that a particular user changed their ready state.
+// BroadcastReadyState notifies that user changed readiness.
 func (lobby *Lobby) BroadcastReadyState(userID uuid.UUID, ready bool) {
 	lobby.BroadcastAll(map[string]interface{}{
 		"type":     "ready_update",
@@ -333,7 +221,7 @@ func (lobby *Lobby) BroadcastReadyState(userID uuid.UUID, ready bool) {
 	})
 }
 
-// BroadcastLeave sends a "lobby_update" message indicating a user left.
+// BroadcastLeave notifies that a user left.
 func (lobby *Lobby) BroadcastLeave(userID uuid.UUID) {
 	lobby.BroadcastAll(map[string]interface{}{
 		"type":      "lobby_update",
@@ -342,7 +230,7 @@ func (lobby *Lobby) BroadcastLeave(userID uuid.UUID) {
 	})
 }
 
-// BroadcastChat sends a chat message from a given user.
+// BroadcastChat broadcasts a chat message from userID.
 func (lobby *Lobby) BroadcastChat(userID uuid.UUID, msg string) {
 	lobby.BroadcastAll(map[string]interface{}{
 		"type":    "chat",
@@ -350,14 +238,4 @@ func (lobby *Lobby) BroadcastChat(userID uuid.UUID, msg string) {
 		"msg":     msg,
 		"ts":      time.Now().Unix(),
 	})
-}
-
-// RemoveUser removes a user from Connections & ReadyStates (if the user
-// unexpectedly disconnects). It's used in readPump's defer if we see an error or close.
-func (lobby *Lobby) RemoveUser(userID uuid.UUID) {
-	delete(lobby.Users, userID)
-	delete(lobby.Connections, userID)
-	delete(lobby.ReadyStates, userID)
-
-	lobby.CancelCountdown()
 }

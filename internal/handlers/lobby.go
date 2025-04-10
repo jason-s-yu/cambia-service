@@ -11,22 +11,20 @@ import (
 	"github.com/jason-s-yu/cambia/internal/game"
 )
 
-var (
-	validGameTypes = map[string]bool{
-		"private":     true,
-		"public":      true,
-		"matchmaking": true,
-	}
-	validGameModes = map[string]bool{
-		"head_to_head": true,
-		"group_of_4":   true,
-		"circuit_4p":   true,
-		"circuit_7p8p": true,
-		"custom":       true,
-	}
-)
+var validGameTypes = map[string]bool{
+	"private":     true,
+	"public":      true,
+	"matchmaking": true,
+}
+var validGameModes = map[string]bool{
+	"head_to_head": true,
+	"group_of_4":   true,
+	"circuit_4p":   true,
+	"circuit_7p8p": true,
+	"custom":       true,
+}
 
-// CreateLobbyHandler handles the creation of a new lobby and adds it to the lobby store
+// CreateLobbyHandler ephemeral: no DB writes, just in-memory create. We also set OnEmpty callback for auto-removal.
 func CreateLobbyHandler(gs *GameServer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cookie := r.Header.Get("Cookie")
@@ -49,7 +47,7 @@ func CreateLobbyHandler(gs *GameServer) http.HandlerFunc {
 
 		lobby := game.NewLobbyWithDefaults(userID)
 
-		if err := json.NewDecoder(r.Body).Decode(lobby); err != nil {
+		if err := json.NewDecoder(r.Body).Decode(lobby); err != nil && err.Error() != "EOF" {
 			http.Error(w, "bad lobby request payload", http.StatusBadRequest)
 			return
 		}
@@ -58,13 +56,17 @@ func CreateLobbyHandler(gs *GameServer) http.HandlerFunc {
 			http.Error(w, "invalid lobby type", http.StatusBadRequest)
 			return
 		}
-
 		if lobby.GameMode != "" && !validGameModes[lobby.GameMode] {
 			http.Error(w, "invalid game mode", http.StatusBadRequest)
 			return
 		}
 
-		// add new lobby to instance store
+		// define OnEmpty => remove from LobbyStore
+		lobby.OnEmpty = func(lobbyID uuid.UUID) {
+			gs.LobbyStore.DeleteLobby(lobbyID)
+		}
+
+		// store ephemeral
 		gs.LobbyStore.AddLobby(lobby)
 
 		w.Header().Set("Content-Type", "application/json")
@@ -72,7 +74,7 @@ func CreateLobbyHandler(gs *GameServer) http.HandlerFunc {
 	}
 }
 
-// ListLobbiesHandler returns all lobbies in the DB, primarily for debugging or admin usage.
+// ListLobbiesHandler ephemeral: we return the in-memory store for debugging
 func ListLobbiesHandler(gs *GameServer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cookie := r.Header.Get("Cookie")
@@ -93,7 +95,6 @@ func ListLobbiesHandler(gs *GameServer) http.HandlerFunc {
 	}
 }
 
-// extractTokenFromCookie returns the JWT token from the "auth_token" cookie segment.
 func extractTokenFromCookie(cookie string) string {
 	parts := strings.Split(cookie, "auth_token=")
 	if len(parts) < 2 {
