@@ -16,29 +16,17 @@ import (
 
 // GameMessage is the standardized JSON structure for all incoming game-related commands.
 type GameMessage struct {
-	// Type is the action string, e.g. "action_snap", "action_draw_stockpile", etc.
-	Type string `json:"type"`
-
-	// Payload is a generic map for any extra JSON fields we might parse (optional).
+	Type    string                 `json:"type"`
 	Payload map[string]interface{} `json:"payload,omitempty"`
 
-	// Card, Card1, Card2 are optional sub-objects if the action involves one or two specific cards.
 	Card  map[string]interface{} `json:"card,omitempty"`
 	Card1 map[string]interface{} `json:"card1,omitempty"`
 	Card2 map[string]interface{} `json:"card2,omitempty"`
 
-	// Special is used for specifying sub-actions in multi-step special card flow, e.g. "swap_peek", "skip", etc.
 	Special string `json:"special,omitempty"`
 }
 
 // GameWSHandler sets up the WebSocket at /game/ws/{game_id}, subprotocol "game".
-//
-// This handler:
-//  1. Extracts the {game_id} from the path.
-//  2. Looks up the in-memory CambiaGame from the GameStore.
-//  3. Authenticates the user, falling back to ephemeral user if none is found.
-//  4. Adds that user to the CambiaGame as a Player (with a new WebSocket connection).
-//  5. Spawns a read loop in a separate goroutine using readGameMessages.
 func GameWSHandler(logger *logrus.Logger, gs *GameServer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// parse game_id from path
@@ -64,7 +52,6 @@ func GameWSHandler(logger *logrus.Logger, gs *GameServer) http.HandlerFunc {
 		// set the broadcast callback if not present
 		if g.BroadcastFn == nil {
 			g.BroadcastFn = func(ev game.GameEvent) {
-				// broadcast to all players
 				for _, pl := range g.Players {
 					if pl.Conn != nil {
 						data, _ := json.Marshal(ev)
@@ -109,14 +96,11 @@ func GameWSHandler(logger *logrus.Logger, gs *GameServer) http.HandlerFunc {
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
 
-		// read loop
-		readGameMessages(ctx, g, p, logger)
+		go readGameMessages(ctx, g, p, logger)
 	}
 }
 
-// readGameMessages continuously reads from the WebSocket for game actions.
-// We parse the "type" and handle "action_*" or "ping" commands.
-// On any read error, we close the connection and mark the player disconnected.
+// readGameMessages handles the standard actions as before.
 func readGameMessages(ctx context.Context, g *game.CambiaGame, p *models.Player, logger *logrus.Logger) {
 	defer func() {
 		p.Conn.Close(websocket.StatusNormalClosure, "closing")
@@ -145,7 +129,13 @@ func readGameMessages(ctx context.Context, g *game.CambiaGame, p *models.Player,
 			handleSimpleAction(g, p.ID, msg)
 
 		case "action_special":
-			handleSpecialAction(g, p.ID, msg)
+			// Pass the relevant fields to ProcessSpecialAction
+			g.ProcessSpecialAction(
+				p.ID,
+				msg.Special, // "peek_self", "skip", etc.
+				msg.Card1,
+				msg.Card2,
+			)
 
 		case "ping":
 			_ = p.Conn.Write(ctx, websocket.MessageText, []byte(`{"action":"pong"}`))
@@ -156,17 +146,13 @@ func readGameMessages(ctx context.Context, g *game.CambiaGame, p *models.Player,
 	}
 }
 
-// handleSimpleAction processes single-step commands like "snap", "draw_stockpile", "discard", "replace", "cambia".
-//
-// The `msg` is our typed GameMessage struct, which includes Card, Payload, etc. as needed.
+// handleSimpleAction processes single-step commands like "snap", "draw_stockpile", etc.
 func handleSimpleAction(g *game.CambiaGame, userID uuid.UUID, msg GameMessage) {
-	// Build a game action from the type & potential card data
 	act := models.GameAction{
 		ActionType: msg.Type,
 		Payload:    map[string]interface{}{},
 	}
 	if msg.Card != nil {
-		// e.g. if there's a card object with "id" or "idx"
 		if idStr, ok := msg.Card["id"].(string); ok && idStr != "" {
 			act.Payload["id"] = idStr
 		}
@@ -174,15 +160,11 @@ func handleSimpleAction(g *game.CambiaGame, userID uuid.UUID, msg GameMessage) {
 			act.Payload["idx"] = idxVal
 		}
 	}
-
 	g.HandlePlayerAction(userID, act)
 }
 
 // handleSpecialAction deals with multi-step logic for K, Q, J, 7,8,9,10.
-//
-// The `msg` struct includes the "special" field for sub-step identification (e.g. "swap_peek").
 func handleSpecialAction(g *game.CambiaGame, userID uuid.UUID, msg GameMessage) {
-	// lock the game, do special action steps
 	g.Mu.Lock()
 	defer g.Mu.Unlock()
 
@@ -240,10 +222,11 @@ func handleSpecialAction(g *game.CambiaGame, userID uuid.UUID, msg GameMessage) 
 
 // doPeekSelf conducts a 7/8 peek_self action.
 func doPeekSelf(g *game.CambiaGame, playerID uuid.UUID) {
+	// For the sample code, let's peek the player's first card if it exists
 	var reveal *models.Card
 	for i := range g.Players {
 		if g.Players[i].ID == playerID && len(g.Players[i].Hand) > 0 {
-			reveal = g.Players[i].Hand[0]
+			reveal = g.Players[i].Hand[0] // or user chooses idx, up to you
 			break
 		}
 	}
@@ -274,7 +257,7 @@ func doPeekOther(g *game.CambiaGame, playerID uuid.UUID, card1 map[string]interf
 	var reveal *models.Card
 	for i := range g.Players {
 		if g.Players[i].ID == targetUserID && len(g.Players[i].Hand) > 0 {
-			reveal = g.Players[i].Hand[0]
+			reveal = g.Players[i].Hand[0] // or a chosen index
 			break
 		}
 	}
@@ -282,12 +265,11 @@ func doPeekOther(g *game.CambiaGame, playerID uuid.UUID, card1 map[string]interf
 		g.FailSpecialAction(playerID, "No card in target's hand to peek")
 		return
 	}
-	// private reveal to action taker
+	// private reveal
 	g.FireEventPrivateSuccess(playerID, "peek_other", reveal, nil)
-	// broadcast partial
-	g.FireEventPlayerSpecialAction(playerID, "peek_other", &models.Card{ID: reveal.ID}, nil, map[string]interface{}{
-		"user": targetUserID.String(),
-	})
+	// public partial info
+	g.FireEventPlayerSpecialAction(playerID, "peek_other", &models.Card{ID: reveal.ID}, nil,
+		map[string]interface{}{"user": targetUserID.String()})
 	g.SpecialAction = game.SpecialActionState{}
 }
 
@@ -299,17 +281,15 @@ func doSwapBlind(g *game.CambiaGame, playerID uuid.UUID, c1, c2 map[string]inter
 		g.FailSpecialAction(playerID, "invalid blind swap targets")
 		return
 	}
-	// if either is in locked Cambia caller => skip
+	// if either is locked by Cambia (caller), skip
 	if g.CambiaCalled && (userA == g.CambiaCallerID || userB == g.CambiaCallerID) {
-		// cannot swap locked
 		g.FailSpecialAction(playerID, "target card belongs to Cambia caller, locked for swap")
 		return
 	}
 	swapTwoCards(g, userA, cardA.ID, userB, cardB.ID)
-	g.FireEventPlayerSpecialAction(playerID, "swap_blind", &models.Card{ID: cardA.ID}, &models.Card{ID: cardB.ID}, map[string]interface{}{
-		"userA": userA.String(),
-		"userB": userB.String(),
-	})
+	g.FireEventPlayerSpecialAction(playerID, "swap_blind",
+		&models.Card{ID: cardA.ID}, &models.Card{ID: cardB.ID},
+		map[string]interface{}{"userA": userA.String(), "userB": userB.String()})
 	g.SpecialAction = game.SpecialActionState{}
 }
 
@@ -321,20 +301,18 @@ func doKingFirstStep(g *game.CambiaGame, playerID uuid.UUID, c1, c2 map[string]i
 		g.FailSpecialAction(playerID, "invalid king step targets")
 		return
 	}
-	// store
+
 	g.SpecialAction.FirstStepDone = true
 	g.SpecialAction.Card1 = cardA
 	g.SpecialAction.Card1Owner = userA
 	g.SpecialAction.Card2 = cardB
 	g.SpecialAction.Card2Owner = userB
 
-	// broadcast partial reveal
-	g.FireEventPlayerSpecialAction(playerID, "swap_peek_reveal", &models.Card{ID: cardA.ID}, &models.Card{ID: cardB.ID}, map[string]interface{}{
-		"userA": userA.String(),
-		"userB": userB.String(),
-	})
-	// private detail
+	g.FireEventPlayerSpecialAction(playerID, "swap_peek_reveal",
+		&models.Card{ID: cardA.ID}, &models.Card{ID: cardB.ID},
+		map[string]interface{}{"userA": userA.String(), "userB": userB.String()})
 	g.FireEventPrivateSuccess(playerID, "swap_peek_reveal", cardA, cardB)
+
 	g.ResetTurnTimer()
 }
 
@@ -348,16 +326,14 @@ func doKingSwapDecision(g *game.CambiaGame, playerID uuid.UUID, c1, c2 map[strin
 		g.FailSpecialAction(playerID, "missing stored king cards")
 		return
 	}
-	// if either is the Cambia caller => cannot swap, but we can peek
 	if g.CambiaCalled && (userA == g.CambiaCallerID || userB == g.CambiaCallerID) {
 		g.FailSpecialAction(playerID, "cannot swap locked Cambia caller's cards")
 		return
 	}
 	swapTwoCards(g, userA, cardA.ID, userB, cardB.ID)
-	g.FireEventPlayerSpecialAction(playerID, "swap_peek_swap", &models.Card{ID: cardA.ID}, &models.Card{ID: cardB.ID}, map[string]interface{}{
-		"userA": userA.String(),
-		"userB": userB.String(),
-	})
+	g.FireEventPlayerSpecialAction(playerID, "swap_peek_swap",
+		&models.Card{ID: cardA.ID}, &models.Card{ID: cardB.ID},
+		map[string]interface{}{"userA": userA.String(), "userB": userB.String()})
 	g.SpecialAction = game.SpecialActionState{}
 	g.AdvanceTurn()
 }
