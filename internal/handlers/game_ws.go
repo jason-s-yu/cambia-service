@@ -96,7 +96,7 @@ func GameWSHandler(logger *logrus.Logger, gs *GameServer) http.HandlerFunc {
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
 
-		go readGameMessages(ctx, g, p, logger)
+		readGameMessages(ctx, g, p, logger)
 	}
 }
 

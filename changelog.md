@@ -2,6 +2,13 @@
 
 # Changelog
 
+## [0.2.3] - 2025-04-10
+
+### Added
+
+- Added `cambia-historian` in `cmd/db/historian.go`, which asynchronously pulls messages from the Redis cache and persists it to the database.
+- Added Redis service in docker compose.
+
 ## [0.2.2] - 2025-04-10
 
 ### Added

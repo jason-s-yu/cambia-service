@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jason-s-yu/cambia/internal/cache"
 	"github.com/jason-s-yu/cambia/internal/database"
 	"github.com/jason-s-yu/cambia/internal/models"
 )
@@ -434,6 +435,32 @@ func (g *CambiaGame) drawCardFromLocation(playerID uuid.UUID, location string) *
 	return nil
 }
 
+// LogGameAction appends the given action to the in-memory Actions list,
+// then pushes a record to Redis for asynchronous persistence.
+func (g *CambiaGame) LogGameAction(userID uuid.UUID, action models.GameAction) {
+	// increment action_index as the next in the sequence
+	actionIndex := len(g.Actions)
+
+	// store in g.Actions for local reference
+	g.Actions = append(g.Actions, action)
+
+	// build the record for Redis
+	rec := cache.GameActionRecord{
+		GameID:        g.ID,
+		ActionIndex:   actionIndex,
+		ActorUserID:   userID,
+		ActionType:    action.ActionType,
+		ActionPayload: action.Payload,
+		Timestamp:     time.Now().UnixMilli(),
+	}
+
+	// push to Redis (non-blocking except for network IO)
+	err := cache.PublishGameAction(context.Background(), rec)
+	if err != nil {
+		log.Printf("WARNING: failed to publish game action to Redis: %v\n", err)
+	}
+}
+
 // HandlePlayerAction interprets draw, discard, snap, cambia, replace, etc.
 func (g *CambiaGame) HandlePlayerAction(playerID uuid.UUID, action models.GameAction) {
 	g.Mu.Lock()
@@ -465,6 +492,8 @@ func (g *CambiaGame) HandlePlayerAction(playerID uuid.UUID, action models.GameAc
 	default:
 		log.Printf("Unknown action %s by player %v\n", action.ActionType, playerID)
 	}
+
+	g.LogGameAction(playerID, action)
 }
 
 // handleDrawFrom draws from either stockpile or discard pile.

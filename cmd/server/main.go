@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/jason-s-yu/cambia/internal/auth"
+	"github.com/jason-s-yu/cambia/internal/cache" // <-- ADDED
 	"github.com/jason-s-yu/cambia/internal/database"
 	"github.com/jason-s-yu/cambia/internal/handlers"
 	"github.com/jason-s-yu/cambia/internal/middleware"
@@ -16,14 +17,20 @@ import (
 
 func main() {
 	auth.Init()
-	// database.ConnectDB()
 	go database.ConnectDBAsync()
+
+	// ADDED: Connect to Redis
+	if err := cache.ConnectRedis(); err != nil {
+		log.Fatalf("Redis connection failed: %v", err)
+	}
+	log.Println("Redis connected successfully.")
 
 	logger := logrus.New()
 	logger.SetLevel(logrus.DebugLevel)
 
 	mux := http.NewServeMux()
 
+	// existing code remains, no removals...
 	// user endpoints
 	mux.HandleFunc("/user/create", handlers.CreateUserHandler)
 	mux.HandleFunc("/user/login", handlers.LoginHandler)
