@@ -1,7 +1,9 @@
+// internal/database/game.go
 package database
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 
@@ -14,14 +16,12 @@ import (
 // RecordGameAndResults persists the final outcome of a game, plus updates rating (1v1, 4p, 7p/8p).
 // We do a basic approach: if players == 2 => "1v1", if 4 => "4p", if 7 or 8 => "7p8p" else no rating update.
 func RecordGameAndResults(ctx context.Context, gameID uuid.UUID, players []*models.Player, finalScores map[uuid.UUID]int, winners []uuid.UUID) error {
-	// Insert or update games row
 	err := pgx.BeginTxFunc(ctx, DB, pgx.TxOptions{}, func(tx pgx.Tx) error {
-		// upsert game row if not exist
+		// upsert the game row if not exist, set status=completed
 		upsertGame := `
 			INSERT INTO games (id, status)
 			VALUES ($1, 'completed')
-			ON CONFLICT (id) 
-			DO UPDATE SET status = 'completed'
+			ON CONFLICT (id) DO UPDATE SET status = 'completed'
 		`
 		if _, e := tx.Exec(ctx, upsertGame, gameID); e != nil {
 			return e
@@ -31,8 +31,8 @@ func RecordGameAndResults(ctx context.Context, gameID uuid.UUID, players []*mode
 		for _, pl := range players {
 			score := finalScores[pl.ID]
 			didWin := false
-			for _, wID := range winners {
-				if wID == pl.ID {
+			for _, w := range winners {
+				if w == pl.ID {
 					didWin = true
 					break
 				}
@@ -71,9 +71,7 @@ func RecordGameAndResults(ctx context.Context, gameID uuid.UUID, players []*mode
 		return nil
 	}
 
-	// fetch user objects from DB, then run rating.FinalizeRatings
-	// we assume .Elo1v1 for 1v1, but similarly we might do .Elo4p or .Elo7p8p
-	// For brevity, we always do .Elo1v1 in this example
+	// load user objects from DB for rating
 	var userList []models.User
 	for _, p := range players {
 		u, err := GetUserByID(ctx, p.ID)
@@ -90,8 +88,10 @@ func RecordGameAndResults(ctx context.Context, gameID uuid.UUID, players []*mode
 		smap[p.ID] = finalScores[p.ID]
 	}
 
+	// finalize rating
 	updated := rating.FinalizeRatings(userList, smap)
-	// store updated rating in DB
+
+	// store updated rating for each user + rating record
 	err = pgx.BeginTxFunc(ctx, DB, pgx.TxOptions{}, func(tx pgx.Tx) error {
 		for i, uNew := range updated {
 			uOld := userList[i]
@@ -119,4 +119,64 @@ func RecordGameAndResults(ctx context.Context, gameID uuid.UUID, players []*mode
 	}
 
 	return nil
+}
+
+// StoreFinalGameStateInDB updates the games.final_game_state column with JSON containing
+// each player's final hand (rank/suit/value) plus the winner userIDs.
+func StoreFinalGameStateInDB(ctx context.Context, gameID uuid.UUID, finalSnapshot map[string]interface{}) error {
+	jsonData, err := json.Marshal(finalSnapshot)
+	if err != nil {
+		return fmt.Errorf("failed to marshal final snapshot: %w", err)
+	}
+	query := `
+		UPDATE games
+		SET final_game_state = $1
+		WHERE id = $2
+	`
+	err = pgx.BeginTxFunc(ctx, DB, pgx.TxOptions{}, func(tx pgx.Tx) error {
+		_, e := tx.Exec(ctx, query, jsonData, gameID)
+		return e
+	})
+	if err != nil {
+		return fmt.Errorf("storing final game state in DB: %w", err)
+	}
+	return nil
+}
+
+// StoreInitialGameStateInDB sets the games.initial_game_state column with any JSON data
+// we want for reconstructing the start of the game (deck order, dealt hands, etc.).
+func StoreInitialGameStateInDB(ctx context.Context, gameID uuid.UUID, initSnapshot map[string]interface{}) error {
+	js, err := json.Marshal(initSnapshot)
+	if err != nil {
+		return err
+	}
+	q := `
+		UPDATE games
+		SET initial_game_state = $1, status = 'in_progress', start_time = NOW()
+		WHERE id = $2
+	`
+	return pgx.BeginTxFunc(ctx, DB, pgx.TxOptions{}, func(tx pgx.Tx) error {
+		_, e := tx.Exec(ctx, q, js, gameID)
+		return e
+	})
+}
+
+// UpsertInitialGameState stores 'snap' of the deck + initial player hands into games.initial_game_state.
+func UpsertInitialGameState(gameID uuid.UUID, initialData interface{}) {
+	ctx := context.Background()
+	dataBytes, err := json.Marshal(initialData)
+	if err != nil {
+		log.Printf("failed to marshal initial game state for game %v: %v", gameID, err)
+		return
+	}
+	_ = pgx.BeginTxFunc(ctx, DB, pgx.TxOptions{}, func(tx pgx.Tx) error {
+		q := `
+			INSERT INTO games (id, status, initial_game_state, start_time)
+			VALUES ($1, 'in_progress', $2, NOW())
+			ON CONFLICT (id)
+			DO UPDATE SET initial_game_state = EXCLUDED.initial_game_state, status='in_progress'
+		`
+		_, e := tx.Exec(ctx, q, gameID, dataBytes)
+		return e
+	})
 }

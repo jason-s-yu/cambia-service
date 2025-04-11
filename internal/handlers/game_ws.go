@@ -90,9 +90,19 @@ func GameWSHandler(logger *logrus.Logger, gs *GameServer) http.HandlerFunc {
 			Conn:      c,
 		}
 		g.AddPlayer(p)
+
+		// Mark as reconnected in game
+		g.HandleReconnect(userID)
+
+		// Immediately send obfuscated state so this user is up to date
+		obfState := g.GetCurrentObfuscatedGameState(userID)
+		payload, _ := json.Marshal(obfState)
+		_ = c.Write(context.Background(), websocket.MessageText, []byte(
+			`{"type":"private_sync_state","state":`+string(payload)+`}`,
+		))
+
 		logger.Infof("User %v joined game %v via WS", userID, gameID)
 
-		// create a context for the read loop
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
 

@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jason-s-yu/cambia/internal/cache"
 	"github.com/jason-s-yu/cambia/internal/database"
 	"github.com/jason-s-yu/cambia/internal/models"
 )
@@ -35,8 +34,10 @@ const (
 	EventPrivateSpecialAction     GameEventType = "private_special_action_success"
 	EventPrivateSpecialActionFail GameEventType = "private_special_action_fail"
 
-	EventPlayerCambia GameEventType = "player_cambia"
-	EventPlayerTurn   GameEventType = "player_turn"
+	EventPlayerCambia  GameEventType = "player_cambia"
+	EventPlayerTurn    GameEventType = "player_turn"
+	EventPrivateSync   GameEventType = "private_sync_state"
+	EventPrivateReveal GameEventType = "private_initial_cards"
 )
 
 // GameEvent holds data about an event that can be broadcast to the clients in a consistent format.
@@ -72,55 +73,196 @@ type CambiaGame struct {
 	Deck        []*models.Card
 	DiscardPile []*models.Card
 
+	// Turn logic
 	CurrentPlayerIndex int
-	Started            bool
-	GameOver           bool
+	TurnID             int
+	TurnDuration       time.Duration
+	turnTimer          *time.Timer
 
-	lastSeen     map[uuid.UUID]time.Time
-	turnTimer    *time.Timer
-	TurnID       int
-	TurnDuration time.Duration
+	Started       bool
+	GameOver      bool
+	PreGameActive bool
+	lastSeen      map[uuid.UUID]time.Time
+	Mu            sync.Mutex
 
+	// Actions accumulates each move for in-memory reference. Also pushed to Redis for historian.
 	Actions []models.GameAction
 
-	OnGameEnd   OnGameEndFunc
-	BroadcastFn func(ev GameEvent) // callback to broadcast game events
+	// BroadcastFn is used to send events to all players. If nil, no broadcast is done.
+	BroadcastFn func(ev GameEvent)
+
+	// OnGameEnd is invoked at game end to broadcast results, etc.
+	OnGameEnd OnGameEndFunc
 
 	// SpecialAction is used for multi-step card logic (K, Q, J, etc.)
 	SpecialAction SpecialActionState
 
-	Mu sync.Mutex
-
-	// CambiaCalled tracks if a player has invoked "Cambia". If so, we do a final round logic.
+	// Cambia-called tracking
 	CambiaCalled       bool
 	CambiaCallerID     uuid.UUID
-	CambiaFinalCounter int // how many "other players" have taken their final turn
+	CambiaFinalCounter int
 
-	// If SnapRace is true, we only allow one successful snap per discard.
+	// Snap usage
 	snapUsedForThisDiscard bool
+
+	// Timer that schedules the real start after pre-game
+	preGameTimer *time.Timer
 }
 
 // NewCambiaGame builds an empty instance with a newly shuffled deck.
 func NewCambiaGame() *CambiaGame {
-	id, _ := uuid.NewV7()
+	id, _ := uuid.NewRandom()
 	g := &CambiaGame{
-		ID:                 id,
-		Deck:               []*models.Card{},
-		DiscardPile:        []*models.Card{},
-		lastSeen:           make(map[uuid.UUID]time.Time),
-		TurnID:             0,
-		CurrentPlayerIndex: 0,
-		Started:            false,
-		GameOver:           false,
-		TurnDuration:       15 * time.Second,
-		SpecialAction:      SpecialActionState{},
-		CambiaCalled:       false,
-		CambiaFinalCounter: 0,
-
+		ID:                     id,
+		Deck:                   []*models.Card{},
+		DiscardPile:            []*models.Card{},
+		lastSeen:               make(map[uuid.UUID]time.Time),
+		CurrentPlayerIndex:     0,
+		TurnDuration:           15 * time.Second,
 		snapUsedForThisDiscard: false,
 	}
 	g.initializeDeck()
 	return g
+}
+
+// BeginPreGame deals each player 4 cards, broadcasts each player's two closest cards (idx 0,1).
+// Then starts a 10s timer. Once done, StartGame() is invoked.
+func (g *CambiaGame) BeginPreGame() {
+	g.Mu.Lock()
+	defer g.Mu.Unlock()
+
+	if g.Started || g.GameOver || g.PreGameActive {
+		return
+	}
+	g.PreGameActive = true
+
+	// Default turn duration from house rules if set
+	if g.HouseRules.TurnTimerSec > 0 {
+		g.TurnDuration = time.Duration(g.HouseRules.TurnTimerSec) * time.Second
+	}
+
+	// Deal 4 cards each
+	for _, p := range g.Players {
+		p.Hand = make([]*models.Card, 0, 4)
+		for i := 0; i < 4; i++ {
+			card := g.drawTopStockpile(false)
+			if card == nil {
+				break
+			}
+			p.Hand = append(p.Hand, card)
+		}
+	}
+
+	// Prepare storing the initial deck/hand state in DB for full replay:
+	g.persistInitialGameState()
+
+	// For each player: privately reveal their idx=0 and idx=1 cards
+	for _, p := range g.Players {
+		if g.BroadcastFn == nil || p.Conn == nil {
+			continue
+		}
+		if len(p.Hand) < 2 {
+			continue
+		}
+		c0 := p.Hand[0]
+		c1 := p.Hand[1]
+		g.firePrivateInitialCards(p.ID, c0, c1)
+	}
+
+	// Start a 10-second timer that transitions from pre-game => in-progress
+	g.preGameTimer = time.AfterFunc(10*time.Second, func() {
+		g.StartGame()
+	})
+}
+
+// StartGame finalizes the pre-game stage and begins the normal turn cycle.
+func (g *CambiaGame) StartGame() {
+	g.Mu.Lock()
+	defer g.Mu.Unlock()
+
+	if g.GameOver || g.Started == true {
+		return
+	}
+	g.PreGameActive = false
+	g.Started = true
+
+	g.scheduleNextTurnTimer()
+	g.broadcastPlayerTurn()
+}
+
+// Start is left for backward compatibility, call BeginPreGame() => StartGame().
+//
+// Deprecated: Use BeginPreGame() instead.
+func (g *CambiaGame) Start() {
+	g.BeginPreGame() // automatically transitions after 10s
+}
+
+// firePrivateInitialCards sends the 2 revealed cards for a player's pre-game reveal (idx 0,1).
+func (g *CambiaGame) firePrivateInitialCards(playerID uuid.UUID, c0, c1 *models.Card) {
+	ev := GameEvent{
+		Type:   EventPrivateReveal,
+		UserID: playerID,
+		Other: map[string]interface{}{
+			"revealed": []map[string]interface{}{
+				{
+					"id":    c0.ID.String(),
+					"rank":  c0.Rank,
+					"suit":  c0.Suit,
+					"value": c0.Value,
+					"idx":   0,
+				},
+				{
+					"id":    c1.ID.String(),
+					"rank":  c1.Rank,
+					"suit":  c1.Suit,
+					"value": c1.Value,
+					"idx":   1,
+				},
+			},
+		},
+	}
+	g.fireEventToPlayer(playerID, ev)
+}
+
+// fireEventToPlayer is a helper that only sends an event to a single player's connection.
+func (g *CambiaGame) fireEventToPlayer(playerID uuid.UUID, ev GameEvent) {
+	if g.BroadcastFn == nil {
+		return
+	}
+	// We only want to write to that single player's websocket. We'll find them & do a single write:
+	for _, p := range g.Players {
+		if p.ID == playerID && p.Conn != nil {
+			data := convertEventToBytes(ev)
+			p.Conn.Write(context.Background(), 1, data) // 1 => websocket.MessageText
+			break
+		}
+	}
+}
+
+// persistInitialGameState saves the entire deck order and each player's initial 4 cards into games.initial_game_state.
+// This is used so a replay can reconstruct the original deck and hands. This does not do obfuscation.
+func (g *CambiaGame) persistInitialGameState() {
+	type initialState struct {
+		Deck    []models.Card               `json:"deck"`
+		Players map[uuid.UUID][]models.Card `json:"players"`
+	}
+
+	snap := initialState{
+		Deck:    make([]models.Card, len(g.Deck)),
+		Players: make(map[uuid.UUID][]models.Card),
+	}
+	for i, c := range g.Deck {
+		snap.Deck[i] = *c
+	}
+	for _, p := range g.Players {
+		var arr []models.Card
+		for _, c := range p.Hand {
+			arr = append(arr, *c)
+		}
+		snap.Players[p.ID] = arr
+	}
+
+	go database.UpsertInitialGameState(g.ID, snap)
 }
 
 // AddPlayer merges the logic from old AddPlayer. If the player already exists, update the conn.
@@ -183,37 +325,6 @@ func (g *CambiaGame) initializeDeck() {
 		deck[i], deck[j] = deck[j], deck[i]
 	})
 	g.Deck = deck
-}
-
-// Start sets up the game state: deal initial cards, start turn timers, etc.
-func (g *CambiaGame) Start() {
-	g.Mu.Lock()
-	defer g.Mu.Unlock()
-
-	if g.Started || g.GameOver {
-		return
-	}
-	g.Started = true
-
-	if g.HouseRules.TurnTimerSec > 0 {
-		g.TurnDuration = time.Duration(g.HouseRules.TurnTimerSec) * time.Second
-	} else {
-		g.TurnDuration = 0
-	}
-
-	// deal 4 cards each
-	for _, p := range g.Players {
-		p.Hand = []*models.Card{}
-		for i := 0; i < 4; i++ {
-			card := g.drawTopStockpile(false)
-			if card == nil {
-				break
-			}
-			p.Hand = append(p.Hand, card)
-		}
-	}
-	g.scheduleNextTurnTimer()
-	g.broadcastPlayerTurn()
 }
 
 // drawTopStockpile draws the top card from the stockpile, re-shuffling discard if needed.
@@ -292,33 +403,44 @@ func (g *CambiaGame) scheduleNextTurnTimer() {
 	})
 }
 
-// handleTimeout forcibly draws & discards for the current player if they time out.
+// handleTimeout forcibly discards a card for the current player if they run out of time.
 func (g *CambiaGame) handleTimeout(playerID uuid.UUID) {
-	log.Printf("Player %v timed out. Force draw & discard.\n", playerID)
-	// If there's a special action in progress for them, skip it
+	log.Printf("Player %v timed out. Force discard.\n", playerID)
 	if g.SpecialAction.Active && g.SpecialAction.PlayerID == playerID {
 		log.Printf("Timeout skipping special action for player %v", playerID)
 		g.SpecialAction = SpecialActionState{}
 	}
 
-	// forcibly draw top of stock
-	card := g.drawTopStockpile(true)
-	if card != nil {
-		g.fireEvent(GameEvent{
-			Type:   EventPrivateDrawStock,
-			UserID: playerID,
-			Card:   &models.Card{ID: card.ID, Rank: card.Rank, Suit: card.Suit, Value: card.Value},
-		})
-		// discard immediately
-		g.DiscardPile = append(g.DiscardPile, card)
+	// Check if player already has a 'drawnCard'
+	var cardToDiscard *models.Card
+	for i := range g.Players {
+		if g.Players[i].ID == playerID {
+			if g.Players[i].DrawnCard != nil {
+				// Discard that drawn card
+				cardToDiscard = g.Players[i].DrawnCard
+				g.Players[i].DrawnCard = nil
+			}
+			break
+		}
+	}
+
+	// If the user did NOT already draw a card this turn, forcibly draw from stockpile
+	if cardToDiscard == nil {
+		cardToDiscard = g.drawTopStockpile(true)
+	}
+
+	if cardToDiscard != nil {
+		// Discard it
+		g.DiscardPile = append(g.DiscardPile, cardToDiscard)
 		g.fireEvent(GameEvent{
 			Type:   EventPlayerDiscard,
 			UserID: playerID,
-			Card:   card,
+			Card:   cardToDiscard,
 		})
-		// reset snap usage for new discard
+		// reset snap usage
 		g.snapUsedForThisDiscard = false
 	}
+
 	g.advanceTurn()
 }
 
@@ -375,7 +497,7 @@ func (g *CambiaGame) HandleDisconnect(playerID uuid.UUID) {
 	}
 }
 
-// HandleReconnect sets the player as reconnected
+// handleReconnect sets the player as reconnected
 func (g *CambiaGame) HandleReconnect(playerID uuid.UUID) {
 	g.Mu.Lock()
 	defer g.Mu.Unlock()
@@ -435,32 +557,6 @@ func (g *CambiaGame) drawCardFromLocation(playerID uuid.UUID, location string) *
 	return nil
 }
 
-// LogGameAction appends the given action to the in-memory Actions list,
-// then pushes a record to Redis for asynchronous persistence.
-func (g *CambiaGame) LogGameAction(userID uuid.UUID, action models.GameAction) {
-	// increment action_index as the next in the sequence
-	actionIndex := len(g.Actions)
-
-	// store in g.Actions for local reference
-	g.Actions = append(g.Actions, action)
-
-	// build the record for Redis
-	rec := cache.GameActionRecord{
-		GameID:        g.ID,
-		ActionIndex:   actionIndex,
-		ActorUserID:   userID,
-		ActionType:    action.ActionType,
-		ActionPayload: action.Payload,
-		Timestamp:     time.Now().UnixMilli(),
-	}
-
-	// push to Redis (non-blocking except for network IO)
-	err := cache.PublishGameAction(context.Background(), rec)
-	if err != nil {
-		log.Printf("WARNING: failed to publish game action to Redis: %v\n", err)
-	}
-}
-
 // HandlePlayerAction interprets draw, discard, snap, cambia, replace, etc.
 func (g *CambiaGame) HandlePlayerAction(playerID uuid.UUID, action models.GameAction) {
 	g.Mu.Lock()
@@ -492,8 +588,6 @@ func (g *CambiaGame) HandlePlayerAction(playerID uuid.UUID, action models.GameAc
 	default:
 		log.Printf("Unknown action %s by player %v\n", action.ActionType, playerID)
 	}
-
-	g.LogGameAction(playerID, action)
 }
 
 // handleDrawFrom draws from either stockpile or discard pile.

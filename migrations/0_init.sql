@@ -1,3 +1,5 @@
+-- migrations/0_init.sql
+
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- ==============
@@ -42,6 +44,10 @@ CREATE TABLE IF NOT EXISTS games (
     start_time          TIMESTAMP,
     end_time            TIMESTAMP,
     initial_game_state  JSONB,                        -- store partial info about initial deals, etc.
+
+    -- Added for v0.2.4 to store final snapshot of each player's hand & game winners
+    final_game_state    JSONB,
+
     created_at          TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -97,7 +103,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- updated at triggers on each table
+-- updated_at triggers
 CREATE TRIGGER set_updated_at_users
 BEFORE UPDATE ON users
 FOR EACH ROW
@@ -105,11 +111,6 @@ EXECUTE PROCEDURE set_updated_at();
 
 CREATE TRIGGER set_updated_at_friends
 BEFORE UPDATE ON friends
-FOR EACH ROW
-EXECUTE PROCEDURE set_updated_at();
-
-CREATE TRIGGER set_updated_at_lobbies
-BEFORE UPDATE ON lobbies
 FOR EACH ROW
 EXECUTE PROCEDURE set_updated_at();
 

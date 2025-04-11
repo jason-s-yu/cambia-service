@@ -1,4 +1,4 @@
-// cmd/db/historian.go
+// cmd/db/historian.go is an asynchronous historian service that pops message data from a Redis queue and persists it to a PostgreSQL database.
 package main
 
 import (
