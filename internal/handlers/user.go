@@ -220,3 +220,42 @@ func LoginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 }
+
+func MeHandler(w http.ResponseWriter, r *http.Request) {
+	token := extractTokenFromCookie(r.Header.Get("Cookie"))
+	userIDStr, err := auth.AuthenticateJWT(token)
+	if err != nil {
+		http.Error(w, "invalid token", http.StatusForbidden)
+		return
+	}
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		http.Error(w, "invalid user id in token", http.StatusForbidden)
+		return
+	}
+
+	user, err := database.GetUserByID(r.Context(), userID)
+	if err != nil {
+		http.Error(w, "user not found", http.StatusNotFound)
+		return
+	}
+
+	sanitizedUser := struct {
+		ID          uuid.UUID `json:"id"`
+		Username    string    `json:"username"`
+		IsEphemeral bool      `json:"is_ephemeral"`
+		IsAdmin     bool      `json:"is_admin"`
+		// include additional non-sensitive fields as needed
+	}{
+		ID:          user.ID,
+		Username:    user.Username,
+		IsEphemeral: user.IsEphemeral,
+		IsAdmin:     user.IsAdmin,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(sanitizedUser); err != nil {
+		http.Error(w, "failed to write response", http.StatusInternalServerError)
+		return
+	}
+}

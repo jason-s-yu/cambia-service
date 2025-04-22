@@ -1,7 +1,9 @@
+// internal/game/rules.go
 package game
 
 import "fmt"
 
+// HouseRules defines optional game rules that can modify standard play.
 type HouseRules struct {
 	AllowDrawFromDiscardPile bool `json:"allowDrawFromDiscardPile"` // allow players to draw from the discard pile
 	AllowReplaceAbilities    bool `json:"allowReplaceAbilities"`    // allow cards discarded from a draw and replace to use their special abilities
@@ -16,57 +18,64 @@ type HouseRules struct {
 // If a rule is not set or defined, it will be ignored, and the old value will persist.
 func (rules *HouseRules) Update(newRules map[string]interface{}) error {
 	var ok bool
+	var err error // Declare error variable
 
-	if val, exists := newRules["allowDrawFromDiscardPile"]; exists && val != nil {
-		if rules.AllowDrawFromDiscardPile, ok = val.(bool); !ok {
-			return fmt.Errorf("invalid type for allowDrawFromDiscardPile")
+	// Helper function to handle type assertion and assignment
+	assignBool := func(field *bool, key string) error {
+		if val, exists := newRules[key]; exists && val != nil {
+			*field, ok = val.(bool)
+			if !ok {
+				return fmt.Errorf("invalid type for %s", key)
+			}
 		}
-		rules.AllowDrawFromDiscardPile = val.(bool)
+		return nil
 	}
-	if val, exists := newRules["allowReplaceAbilities"]; exists && val != nil {
-		if rules.AllowReplaceAbilities, ok = val.(bool); !ok {
-			return fmt.Errorf("invalid type for allowReplaceAbilities")
+
+	assignInt := func(field *int, key string, minVal int, validationMsg string) error {
+		if val, exists := newRules[key]; exists && val != nil {
+			// JSON numbers are often float64, handle conversion
+			var floatVal float64
+			floatVal, ok = val.(float64)
+			if !ok {
+				// Try int if float64 fails
+				var intVal int
+				intVal, ok = val.(int)
+				if !ok {
+					return fmt.Errorf("invalid type for %s", key)
+				}
+				*field = intVal
+			} else {
+				*field = int(floatVal)
+			}
+
+			if *field < minVal {
+				return fmt.Errorf(validationMsg)
+			}
 		}
-		rules.AllowReplaceAbilities = val.(bool)
+		return nil
 	}
-	if val, exists := newRules["snapRace"]; exists && val != nil {
-		if rules.SnapRace, ok = val.(bool); !ok {
-			return fmt.Errorf("invalid type for snapRace")
-		}
-		rules.SnapRace = val.(bool)
+
+	// Apply updates using helpers
+	if err = assignBool(&rules.AllowDrawFromDiscardPile, "allowDrawFromDiscardPile"); err != nil {
+		return err
 	}
-	if val, exists := newRules["forfeitOnDisconnect"]; exists && val != nil {
-		if rules.ForfeitOnDisconnect, ok = val.(bool); !ok {
-			return fmt.Errorf("invalid type for forfeitOnDisconnect")
-		}
-		rules.ForfeitOnDisconnect = val.(bool)
+	if err = assignBool(&rules.AllowReplaceAbilities, "allowReplaceAbilities"); err != nil {
+		return err
 	}
-	if val, exists := newRules["penaltyDrawCount"]; exists && val != nil {
-		if rules.PenaltyDrawCount, ok = val.(int); !ok {
-			return fmt.Errorf("invalid type for penaltyDrawCount")
-		}
-		if val.(int) < 0 {
-			return fmt.Errorf("penaltyDrawCount must be greater than or equal to 0; set to 0 for no penalty")
-		}
-		rules.PenaltyDrawCount = val.(int)
+	if err = assignBool(&rules.SnapRace, "snapRace"); err != nil {
+		return err
 	}
-	if val, exists := newRules["autoKickTurnCount"]; exists && val != nil {
-		if rules.AutoKickTurnCount, ok = val.(int); !ok {
-			return fmt.Errorf("invalid type for autoKickTurnCount")
-		}
-		if val.(int) < 0 {
-			return fmt.Errorf("autoKickTurnCount must be at least 0; set to 0 to disable auto-kick")
-		}
-		rules.AutoKickTurnCount = val.(int)
+	if err = assignBool(&rules.ForfeitOnDisconnect, "forfeitOnDisconnect"); err != nil {
+		return err
 	}
-	if val, exists := newRules["turnTimerSec"]; exists && val != nil {
-		if rules.TurnTimerSec, ok = val.(int); !ok {
-			return fmt.Errorf("invalid type for turnTimerSec")
-		}
-		if val.(int) < 0 {
-			return fmt.Errorf("turnTimerSec must be at least 0; set to 0 to disable turn timer")
-		}
-		rules.TurnTimerSec = val.(int)
+	if err = assignInt(&rules.PenaltyDrawCount, "penaltyDrawCount", 0, "penaltyDrawCount must be non-negative"); err != nil {
+		return err
+	}
+	if err = assignInt(&rules.AutoKickTurnCount, "autoKickTurnCount", 0, "autoKickTurnCount must be non-negative"); err != nil {
+		return err
+	}
+	if err = assignInt(&rules.TurnTimerSec, "turnTimerSec", 0, "turnTimerSec must be non-negative"); err != nil {
+		return err
 	}
 
 	return nil
@@ -74,44 +83,9 @@ func (rules *HouseRules) Update(newRules map[string]interface{}) error {
 
 // ParseRules converts a map of rules to a HouseRules struct. It will ensure the types are valid.
 func ParseRules(rules map[string]interface{}, current HouseRules) (HouseRules, error) {
+	// Create a copy to modify
 	houseRules := current
-	var ok bool
-
-	if val, exists := rules["allowDrawFromDiscardPile"]; exists && val != nil {
-		if houseRules.AllowDrawFromDiscardPile, ok = val.(bool); !ok {
-			return houseRules, fmt.Errorf("invalid type for allowDrawFromDiscardPile")
-		}
-	}
-	if val, exists := rules["allowReplaceAbilities"]; exists && val != nil {
-		if houseRules.AllowReplaceAbilities, ok = val.(bool); !ok {
-			return houseRules, fmt.Errorf("invalid type for allowReplaceAbilities")
-		}
-	}
-	if val, exists := rules["snapRace"]; exists && val != nil {
-		if houseRules.SnapRace, ok = val.(bool); !ok {
-			return houseRules, fmt.Errorf("invalid type for snapRace")
-		}
-	}
-	if val, exists := rules["forfeitOnDisconnect"]; exists && val != nil {
-		if houseRules.ForfeitOnDisconnect, ok = val.(bool); !ok {
-			return houseRules, fmt.Errorf("invalid type for forfeitOnDisconnect")
-		}
-	}
-	if val, exists := rules["penaltyDrawCount"]; exists && val != nil {
-		if houseRules.PenaltyDrawCount, ok = val.(int); !ok {
-			return houseRules, fmt.Errorf("invalid type for penaltyDrawCount")
-		}
-	}
-	if val, exists := rules["autoKickTurnCount"]; exists && val != nil {
-		if houseRules.AutoKickTurnCount, ok = val.(int); !ok {
-			return houseRules, fmt.Errorf("invalid type for autoKickTurnCount")
-		}
-	}
-	if val, exists := rules["turnTimerSec"]; exists && val != nil {
-		if houseRules.TurnTimerSec, ok = val.(int); !ok {
-			return houseRules, fmt.Errorf("invalid type for turnTimerSec")
-		}
-	}
-
-	return houseRules, nil
+	// Use the Update method on the copy
+	err := houseRules.Update(rules)
+	return houseRules, err
 }

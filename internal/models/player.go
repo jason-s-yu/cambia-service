@@ -7,7 +7,7 @@ import (
 
 type Player struct {
 	ID              uuid.UUID       `json:"id"`
-	Hand            []*Card         `json:"hand"`
+	Hand            []*Card         `json:"-"` // Hand is generally kept private
 	Connected       bool            `json:"connected"`
 	Conn            *websocket.Conn `json:"-"`
 	HasCalledCambia bool            `json:"hasCalledCambia"`

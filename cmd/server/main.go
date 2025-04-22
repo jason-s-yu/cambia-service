@@ -7,7 +7,7 @@ import (
 	"os"
 
 	"github.com/jason-s-yu/cambia/internal/auth"
-	"github.com/jason-s-yu/cambia/internal/cache" // <-- ADDED
+	"github.com/jason-s-yu/cambia/internal/cache"
 	"github.com/jason-s-yu/cambia/internal/database"
 	"github.com/jason-s-yu/cambia/internal/handlers"
 	"github.com/jason-s-yu/cambia/internal/middleware"
@@ -30,10 +30,10 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// existing code remains, no removals...
 	// user endpoints
 	mux.HandleFunc("/user/create", handlers.CreateUserHandler)
 	mux.HandleFunc("/user/login", handlers.LoginHandler)
+	mux.HandleFunc("/user/me", handlers.MeHandler)
 
 	// friend endpoints
 	mux.HandleFunc("/friends/add", handlers.AddFriendHandler)

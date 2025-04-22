@@ -4,417 +4,346 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
-	"github.com/jason-s-yu/cambia/internal/game"
+	"github.com/jason-s-yu/cambia/internal/game" // Use game package types
 	"github.com/jason-s-yu/cambia/internal/models"
 	"github.com/sirupsen/logrus"
 )
 
-// GameMessage is the standardized JSON structure for all incoming game-related commands.
+// GameMessage represents the structure for incoming WebSocket messages during the game phase.
+// It includes fields necessary for various actions defined in the spec.
 type GameMessage struct {
-	Type    string                 `json:"type"`
-	Payload map[string]interface{} `json:"payload,omitempty"`
+	Type string `json:"type"`
 
-	Card  map[string]interface{} `json:"card,omitempty"`
-	Card1 map[string]interface{} `json:"card1,omitempty"`
-	Card2 map[string]interface{} `json:"card2,omitempty"`
+	// Used for single-card actions like discard, snap, replace
+	Card map[string]interface{} `json:"card,omitempty"` // Use map for flexibility
 
+	// Used for special actions involving two cards (swaps)
+	Card1 map[string]interface{} `json:"card1,omitempty"` // Use map
+	Card2 map[string]interface{} `json:"card2,omitempty"` // Use map
+
+	// Used for special actions to specify the sub-action (e.g., "peek_self", "skip")
 	Special string `json:"special,omitempty"`
+
+	// Generic payload for extensibility, though spec uses top-level fields mostly
+	Payload map[string]interface{} `json:"payload,omitempty"`
 }
 
-// GameWSHandler sets up the WebSocket at /game/ws/{game_id}, subprotocol "game".
+// GameWSHandler upgrades the connection and handles the game WebSocket lifecycle.
 func GameWSHandler(logger *logrus.Logger, gs *GameServer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// parse game_id from path
+		// 1. Extract Game ID from URL path
 		pathParts := strings.Split(strings.TrimPrefix(r.URL.Path, "/game/ws/"), "/")
-		if len(pathParts) < 1 {
-			http.Error(w, "missing game_id", http.StatusBadRequest)
+		if len(pathParts) < 1 || pathParts[0] == "" {
+			http.Error(w, "Missing game_id in path (/game/ws/{game_id})", http.StatusBadRequest)
 			return
 		}
 		gameIDStr := pathParts[0]
 		gameID, err := uuid.Parse(gameIDStr)
 		if err != nil {
-			http.Error(w, "invalid game_id", http.StatusBadRequest)
+			http.Error(w, "Invalid game_id format", http.StatusBadRequest)
 			return
 		}
 
-		// look up in-memory CambiaGame
+		// 2. Find the game instance in the GameServer's store
 		g, ok := gs.GameStore.GetGame(gameID)
 		if !ok {
-			http.Error(w, "game not found", http.StatusNotFound)
+			http.Error(w, "Game not found", http.StatusNotFound)
+			return
+		}
+		if g.GameOver {
+			http.Error(w, "Game has already ended", http.StatusGone) // 410 Gone might be appropriate
 			return
 		}
 
-		// set the broadcast callback if not present
+		// 3. Upgrade WebSocket connection
+		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols:   []string{"game"}, // Enforce "game" subprotocol
+			OriginPatterns: []string{"*"},    // Allow all origins (adjust for production)
+		})
+		if err != nil {
+			logger.Warnf("WebSocket accept error for game %s: %v", gameID, err)
+			// Error is implicitly sent by the websocket library
+			return
+		}
+		defer c.Close(websocket.StatusInternalError, "Internal server error during handler exit.") // Ensure closure on error/exit
+
+		if c.Subprotocol() != "game" {
+			logger.Warnf("Client for game %s connected with invalid subprotocol: %s", gameID, c.Subprotocol())
+			c.Close(websocket.StatusPolicyViolation, "Client must use the 'game' subprotocol.")
+			return
+		}
+		logger.Infof("WebSocket connection established for game %s from %s", gameID, r.RemoteAddr)
+
+		// 4. Authenticate user (reuse lobby logic or implement game-specific auth)
+		userID, err := EnsureEphemeralUser(w, r) // Assuming this handles JWT/ephemeral logic
+		if err != nil {
+			logger.Warnf("User authentication failed for game %s: %v", gameID, err)
+			c.Close(websocket.StatusPolicyViolation, "Authentication failed.")
+			return
+		}
+		logger.Infof("User %s authenticated for game %s", userID, gameID)
+
+		// Check if player is actually part of this game
+		isPlayerInGame := false
+		g.Mu.Lock()
+		for _, p := range g.Players {
+			if p.ID == userID {
+				isPlayerInGame = true
+				break
+			}
+		}
+		g.Mu.Unlock()
+		if !isPlayerInGame {
+			logger.Warnf("User %s is not a player in game %s. Closing connection.", userID, gameID)
+			c.Close(websocket.StatusPolicyViolation, "You are not a player in this game.")
+			return
+		}
+
+		// 5. Register broadcast functions if not already set
+		//    These need to be set up carefully to handle concurrency with the game lock.
+		g.Mu.Lock() // Lock game state before modifying broadcast functions or player list
 		if g.BroadcastFn == nil {
 			g.BroadcastFn = func(ev game.GameEvent) {
-				for _, pl := range g.Players {
-					if pl.Conn != nil {
-						data, _ := json.Marshal(ev)
-						pl.Conn.Write(context.Background(), websocket.MessageText, data)
+				// This function will be called FROM within game logic (which holds the lock).
+				// We need to send messages without holding the lock to avoid blocking game state.
+				playersToSend := []*models.Player{}
+				for _, p := range g.Players { // Iterate safely while holding lock
+					if p.Connected && p.Conn != nil {
+						playersToSend = append(playersToSend, p) // Add connected players
 					}
+				}
+
+				// Prepare message bytes once.
+				msgBytes, err := json.Marshal(ev)
+				if err != nil {
+					logger.Errorf("Failed to marshal broadcast event (%s) for game %s: %v", ev.Type, g.ID, err)
+					return // Don't proceed if marshaling fails
+				}
+
+				// Send asynchronously outside the lock.
+				go func(players []*models.Player, data []byte, gameID uuid.UUID) {
+					for _, pl := range players {
+						// Double-check connection status *before* writing, outside lock
+						// It's possible player disconnected between lock release and write attempt.
+						if pl.Conn != nil {
+							ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second) // Timeout for write
+							err := pl.Conn.Write(ctx, websocket.MessageText, data)
+							cancel() // Ensure cancel is called regardless of error
+							if err != nil {
+								logger.Warnf("Failed to write broadcast message to player %s in game %s: %v", pl.ID, gameID, err)
+								// Trigger disconnect handling asynchronously if write fails
+								// Be cautious about triggering this too eagerly (e.g., temporary network issues)
+								// gs.GameStore.HandleDisconnectAsync(gameID, pl.ID) // Needs implementation
+							}
+						}
+					}
+				}(playersToSend, msgBytes, g.ID) // Pass game ID for logging
+			}
+		}
+		if g.BroadcastToPlayerFn == nil {
+			g.BroadcastToPlayerFn = func(targetPlayerID uuid.UUID, ev game.GameEvent) {
+				// Find the player while holding the lock
+				var targetConn *websocket.Conn
+				var targetPlayer *models.Player // Keep track of the player pointer
+				for _, pl := range g.Players {
+					if pl.ID == targetPlayerID {
+						targetPlayer = pl
+						if pl.Connected && pl.Conn != nil {
+							targetConn = pl.Conn
+						}
+						break
+					}
+				}
+
+				// If found and connected, send asynchronously outside the lock
+				if targetConn != nil {
+					msgBytes, err := json.Marshal(ev)
+					if err != nil {
+						logger.Errorf("Failed to marshal private event (%s) for player %s in game %s: %v", ev.Type, targetPlayerID, g.ID, err)
+						return
+					}
+					// Capture necessary variables for the goroutine
+					connToSend := targetConn
+					gameID := g.ID
+					go func(conn *websocket.Conn, data []byte, playerID uuid.UUID, gameID uuid.UUID) {
+						ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+						err := conn.Write(ctx, websocket.MessageText, data)
+						cancel()
+						if err != nil {
+							logger.Warnf("Failed to write private message to player %s in game %s: %v", playerID, gameID, err)
+							// Consider triggering disconnect handling
+							// gs.GameStore.HandleDisconnectAsync(gameID, playerID) // Needs implementation
+						}
+					}(connToSend, msgBytes, targetPlayerID, gameID) // Pass IDs for logging
+				} else if targetPlayer != nil {
+					// Log if player exists but isn't connected
+					// logger.Warnf("Could not send private message to disconnected player %s in game %s", targetPlayerID, g.ID)
+				} else {
+					// Log if player doesn't exist in the game at all
+					// logger.Warnf("Could not find player %s to send private message in game %s", targetPlayerID, g.ID)
 				}
 			}
 		}
+		g.Mu.Unlock() // Unlock after setting up broadcast functions
 
-		// upgrade ws
-		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			Subprotocols: []string{"game"},
-		})
-		if err != nil {
-			logger.Warnf("websocket accept error: %v", err)
-			return
-		}
-		if c.Subprotocol() != "game" {
-			c.Close(websocket.StatusPolicyViolation, "client must speak the game subprotocol")
-			return
-		}
+		// 6. Handle player connection/reconnection in the game logic
+		// This needs the game lock internally. Pass the connection object.
+		g.HandleReconnect(userID, c)
 
-		// authenticate user by cookie if available; form ephemeral user fallback
-		userID, err := EnsureEphemeralUser(w, r)
-		if err != nil {
-			logger.Warnf("failed ephemeral user logic: %v", err)
-			c.Close(websocket.StatusPolicyViolation, "cannot create or auth ephemeral user")
-			return
-		}
-
-		// attach the player to the game
-		p := &models.Player{
-			ID:        userID,
-			Hand:      []*models.Card{},
-			Connected: true,
-			Conn:      c,
-		}
-		g.AddPlayer(p)
-
-		// Mark as reconnected in game
-		g.HandleReconnect(userID)
-
-		// Immediately send obfuscated state so this user is up to date
-		obfState := g.GetCurrentObfuscatedGameState(userID)
-		payload, _ := json.Marshal(obfState)
-		_ = c.Write(context.Background(), websocket.MessageText, []byte(
-			`{"type":"private_sync_state","state":`+string(payload)+`}`,
-		))
-
-		logger.Infof("User %v joined game %v via WS", userID, gameID)
-
+		// 7. Start reading messages from the client
 		ctx, cancel := context.WithCancel(r.Context())
-		defer cancel()
+		defer cancel() // Ensure context cancellation on exit
 
-		readGameMessages(ctx, g, p, logger)
+		// Run the read loop
+		readGameMessages(ctx, c, g, userID, logger)
+
+		// 8. Handle disconnection when readGameMessages returns
+		logger.Infof("Player %s WebSocket read loop exited for game %s.", userID, gameID)
+		// Disconnect handling is now triggered by read error or context cancellation.
+		// Call HandleDisconnect directly here.
+		g.HandleDisconnect(userID)
+		// Close is deferred earlier
+		logger.Infof("Player %s cleanup complete for game %s.", userID, gameID)
 	}
 }
 
-// readGameMessages handles the standard actions as before.
-func readGameMessages(ctx context.Context, g *game.CambiaGame, p *models.Player, logger *logrus.Logger) {
-	defer func() {
-		p.Conn.Close(websocket.StatusNormalClosure, "closing")
-		g.HandleDisconnect(p.ID)
-	}()
-
+// readGameMessages reads incoming messages from a single client WebSocket connection.
+func readGameMessages(ctx context.Context, c *websocket.Conn, g *game.CambiaGame, userID uuid.UUID, logger *logrus.Logger) {
 	for {
-		typ, data, err := p.Conn.Read(ctx)
+		msgType, data, err := c.Read(ctx)
 		if err != nil {
-			logger.Infof("user %v read err: %v", p.ID, err)
-			return
+			// Handle read errors (e.g., connection closed)
+			status := websocket.CloseStatus(err)
+			if status == websocket.StatusNormalClosure || status == websocket.StatusGoingAway {
+				logger.Infof("WebSocket closed normally for user %s in game %s.", userID, g.ID)
+			} else if strings.Contains(err.Error(), "context canceled") {
+				logger.Infof("WebSocket context canceled for user %s in game %s.", userID, g.ID)
+			} else {
+				logger.Warnf("Error reading from WebSocket for user %s in game %s: %v (Status: %d)", userID, g.ID, err, status)
+			}
+			return // Exit loop on read error/closure/cancelation
 		}
-		if typ != websocket.MessageText {
+
+		if msgType != websocket.MessageText {
+			logger.Warnf("Received non-text message type %d from user %s in game %s. Ignoring.", msgType, userID, g.ID)
 			continue
 		}
 
 		var msg GameMessage
 		if err := json.Unmarshal(data, &msg); err != nil {
-			logger.Warnf("invalid json from user %v: %v", p.ID, err)
+			logger.Warnf("Invalid JSON received from user %s in game %s: %v. Data: %s", userID, g.ID, err, string(data))
+			// Optionally send an error back to the client
+			sendWsError(ctx, c, "Invalid JSON format.")
 			continue
 		}
 
-		switch msg.Type {
-		case "action_snap", "action_draw_stockpile", "action_draw_discard",
-			"action_discard", "action_replace", "action_cambia":
-			handleSimpleAction(g, p.ID, msg)
+		logger.Debugf("Received action '%s' from user %s in game %s.", msg.Type, userID, g.ID)
 
+		// Acquire game lock before processing any action that modifies game state
+		g.Mu.Lock()
+
+		// --- Action Processing ---
+		// Check if game is over before processing action
+		if g.GameOver {
+			logger.Warnf("Game %s is over. Ignoring action '%s' from user %s.", g.ID, msg.Type, userID)
+			g.Mu.Unlock() // Release lock
+			continue      // Ignore actions after game over
+		}
+
+		switch msg.Type {
+		// Actions handled by HandlePlayerAction
+		case "action_draw_stockpile", "action_draw_discardpile",
+			"action_discard", "action_replace", "action_cambia", "action_snap":
+			// Prepare the GameAction struct
+			gameAction := models.GameAction{
+				ActionType: msg.Type,
+				Payload:    make(map[string]interface{}),
+			}
+			// Populate payload based on message structure
+			// For discard/replace/snap, payload comes from msg.Card
+			if msg.Card != nil {
+				gameAction.Payload = msg.Card // Pass the whole card object as payload
+			} else if msg.Payload != nil {
+				// Fallback to generic payload if specific one isn't present
+				gameAction.Payload = msg.Payload
+			}
+			// Call the game logic handler (which assumes lock is held)
+			g.HandlePlayerAction(userID, gameAction)
+
+		// Special actions handled by ProcessSpecialAction
 		case "action_special":
-			// Pass the relevant fields to ProcessSpecialAction
-			g.ProcessSpecialAction(
-				p.ID,
-				msg.Special, // "peek_self", "skip", etc.
-				msg.Card1,
-				msg.Card2,
-			)
+			// Call the dedicated special action processor (which assumes lock is held)
+			g.ProcessSpecialAction(userID, msg.Special, msg.Card1, msg.Card2)
 
 		case "ping":
-			_ = p.Conn.Write(ctx, websocket.MessageText, []byte(`{"action":"pong"}`))
+			// Handle ping immediately without holding the lock for the write
+			g.Mu.Unlock() // Release lock before writing
+			logger.Tracef("Received ping from user %s, sending pong.", userID)
+			sendWsMessage(ctx, c, map[string]string{"type": "pong"})
+			g.Mu.Lock() // Re-acquire lock after write (needed for loop consistency)
 
 		default:
-			logger.Warnf("Unknown game action '%s' from user %v", msg.Type, p.ID)
+			logger.Warnf("Unknown action type '%s' from user %s in game %s.", msg.Type, userID, g.ID)
+			// Send error back to client without releasing lock yet
+			sendWsError(ctx, c, fmt.Sprintf("Unknown action type: %s", msg.Type))
+		}
+
+		// Release the lock after processing the action for this iteration
+		g.Mu.Unlock()
+		// --- End Action Processing ---
+
+		// Check context cancellation after processing each message
+		select {
+		case <-ctx.Done():
+			logger.Infof("Context canceled after processing message for user %s in game %s.", userID, g.ID)
+			return // Exit loop if context is cancelled
+		default:
+			// Continue to the next iteration
 		}
 	}
 }
 
-// handleSimpleAction processes single-step commands like "snap", "draw_stockpile", etc.
-func handleSimpleAction(g *game.CambiaGame, userID uuid.UUID, msg GameMessage) {
-	act := models.GameAction{
-		ActionType: msg.Type,
-		Payload:    map[string]interface{}{},
-	}
-	if msg.Card != nil {
-		if idStr, ok := msg.Card["id"].(string); ok && idStr != "" {
-			act.Payload["id"] = idStr
-		}
-		if idxVal, ok := msg.Card["idx"].(float64); ok {
-			act.Payload["idx"] = idxVal
-		}
-	}
-	g.HandlePlayerAction(userID, act)
-}
-
-// handleSpecialAction deals with multi-step logic for K, Q, J, 7,8,9,10.
-func handleSpecialAction(g *game.CambiaGame, userID uuid.UUID, msg GameMessage) {
-	g.Mu.Lock()
-	defer g.Mu.Unlock()
-
-	if !g.SpecialAction.Active || g.SpecialAction.PlayerID != userID {
-		g.FireEventPrivateSpecialActionFail(userID, "No special action in progress")
+// sendWsMessage is a helper to send a structured message to a WebSocket client.
+func sendWsMessage(ctx context.Context, c *websocket.Conn, message interface{}) {
+	if c == nil {
+		log.Println("Error: Attempted to send WebSocket message on nil connection.")
 		return
 	}
-
-	rank := g.SpecialAction.CardRank
-	step := msg.Special
-	if step == "skip" {
-		g.SpecialAction = game.SpecialActionState{}
-		g.AdvanceTurn()
-		return
-	}
-
-	switch rank {
-	case "7", "8":
-		if step != "peek_self" {
-			g.FailSpecialAction(userID, "invalid step for 7/8")
-			return
-		}
-		doPeekSelf(g, userID)
-		g.AdvanceTurn()
-
-	case "9", "10":
-		if step != "peek_other" {
-			g.FailSpecialAction(userID, "invalid step for 9/10")
-			return
-		}
-		doPeekOther(g, userID, msg.Card1)
-		g.AdvanceTurn()
-
-	case "Q", "J":
-		if step != "swap_blind" {
-			g.FailSpecialAction(userID, "invalid step for Q/J")
-			return
-		}
-		doSwapBlind(g, userID, msg.Card1, msg.Card2)
-		g.AdvanceTurn()
-
-	case "K":
-		if step == "swap_peek" {
-			doKingFirstStep(g, userID, msg.Card1, msg.Card2)
-		} else if step == "swap_peek_swap" {
-			doKingSwapDecision(g, userID, msg.Card1, msg.Card2)
-		} else {
-			g.FailSpecialAction(userID, "invalid step for K")
-		}
-
-	default:
-		g.FailSpecialAction(userID, "unsupported rank")
-	}
-}
-
-// doPeekSelf conducts a 7/8 peek_self action.
-func doPeekSelf(g *game.CambiaGame, playerID uuid.UUID) {
-	// For the sample code, let's peek the player's first card if it exists
-	var reveal *models.Card
-	for i := range g.Players {
-		if g.Players[i].ID == playerID && len(g.Players[i].Hand) > 0 {
-			reveal = g.Players[i].Hand[0] // or user chooses idx, up to you
-			break
-		}
-	}
-	if reveal == nil {
-		g.FailSpecialAction(playerID, "No card in own hand to peek")
-		return
-	}
-	g.FireEventPrivateSuccess(playerID, "peek_self", reveal, nil)
-	g.FireEventPlayerSpecialAction(playerID, "peek_self", reveal, nil, nil)
-	g.SpecialAction = game.SpecialActionState{}
-}
-
-// doPeekOther conducts a 9/10 peek_other action.
-func doPeekOther(g *game.CambiaGame, playerID uuid.UUID, card1 map[string]interface{}) {
-	var targetUserID uuid.UUID
-	if card1 != nil {
-		if userMap, ok := card1["user"].(map[string]interface{}); ok {
-			uidStr, _ := userMap["id"].(string)
-			if uid, err := uuid.Parse(uidStr); err == nil {
-				targetUserID = uid
-			}
-		}
-	}
-	if targetUserID == uuid.Nil {
-		g.FailSpecialAction(playerID, "No valid target user for peek_other")
-		return
-	}
-	var reveal *models.Card
-	for i := range g.Players {
-		if g.Players[i].ID == targetUserID && len(g.Players[i].Hand) > 0 {
-			reveal = g.Players[i].Hand[0] // or a chosen index
-			break
-		}
-	}
-	if reveal == nil {
-		g.FailSpecialAction(playerID, "No card in target's hand to peek")
-		return
-	}
-	// private reveal
-	g.FireEventPrivateSuccess(playerID, "peek_other", reveal, nil)
-	// public partial info
-	g.FireEventPlayerSpecialAction(playerID, "peek_other", &models.Card{ID: reveal.ID}, nil,
-		map[string]interface{}{"user": targetUserID.String()})
-	g.SpecialAction = game.SpecialActionState{}
-}
-
-// doSwapBlind conducts a J/Q swap_blind action.
-func doSwapBlind(g *game.CambiaGame, playerID uuid.UUID, c1, c2 map[string]interface{}) {
-	cardA, userA := pickCardFromMessage(g, c1)
-	cardB, userB := pickCardFromMessage(g, c2)
-	if cardA == nil || cardB == nil {
-		g.FailSpecialAction(playerID, "invalid blind swap targets")
-		return
-	}
-	// if either is locked by Cambia (caller), skip
-	if g.CambiaCalled && (userA == g.CambiaCallerID || userB == g.CambiaCallerID) {
-		g.FailSpecialAction(playerID, "target card belongs to Cambia caller, locked for swap")
-		return
-	}
-	swapTwoCards(g, userA, cardA.ID, userB, cardB.ID)
-	g.FireEventPlayerSpecialAction(playerID, "swap_blind",
-		&models.Card{ID: cardA.ID}, &models.Card{ID: cardB.ID},
-		map[string]interface{}{"userA": userA.String(), "userB": userB.String()})
-	g.SpecialAction = game.SpecialActionState{}
-}
-
-// doKingFirstStep is "swap_peek" => reveal two chosen cards privately
-func doKingFirstStep(g *game.CambiaGame, playerID uuid.UUID, c1, c2 map[string]interface{}) {
-	cardA, userA := pickCardFromMessage(g, c1)
-	cardB, userB := pickCardFromMessage(g, c2)
-	if cardA == nil || cardB == nil {
-		g.FailSpecialAction(playerID, "invalid king step targets")
-		return
-	}
-
-	g.SpecialAction.FirstStepDone = true
-	g.SpecialAction.Card1 = cardA
-	g.SpecialAction.Card1Owner = userA
-	g.SpecialAction.Card2 = cardB
-	g.SpecialAction.Card2Owner = userB
-
-	g.FireEventPlayerSpecialAction(playerID, "swap_peek_reveal",
-		&models.Card{ID: cardA.ID}, &models.Card{ID: cardB.ID},
-		map[string]interface{}{"userA": userA.String(), "userB": userB.String()})
-	g.FireEventPrivateSuccess(playerID, "swap_peek_reveal", cardA, cardB)
-
-	g.ResetTurnTimer()
-}
-
-// doKingSwapDecision is "swap_peek_swap" => optionally swap
-func doKingSwapDecision(g *game.CambiaGame, playerID uuid.UUID, c1, c2 map[string]interface{}) {
-	cardA := g.SpecialAction.Card1
-	cardB := g.SpecialAction.Card2
-	userA := g.SpecialAction.Card1Owner
-	userB := g.SpecialAction.Card2Owner
-	if cardA == nil || cardB == nil {
-		g.FailSpecialAction(playerID, "missing stored king cards")
-		return
-	}
-	if g.CambiaCalled && (userA == g.CambiaCallerID || userB == g.CambiaCallerID) {
-		g.FailSpecialAction(playerID, "cannot swap locked Cambia caller's cards")
-		return
-	}
-	swapTwoCards(g, userA, cardA.ID, userB, cardB.ID)
-	g.FireEventPlayerSpecialAction(playerID, "swap_peek_swap",
-		&models.Card{ID: cardA.ID}, &models.Card{ID: cardB.ID},
-		map[string]interface{}{"userA": userA.String(), "userB": userB.String()})
-	g.SpecialAction = game.SpecialActionState{}
-	g.AdvanceTurn()
-}
-
-// pickCardFromMessage finds a card based on ID and returns it, for a swap action.
-func pickCardFromMessage(g *game.CambiaGame, cardMap map[string]interface{}) (*models.Card, uuid.UUID) {
-	if cardMap == nil {
-		return nil, uuid.Nil
-	}
-	cardIDStr, _ := cardMap["id"].(string)
-	if cardIDStr == "" {
-		return nil, uuid.Nil
-	}
-	cardID, err := uuid.Parse(cardIDStr)
+	msgBytes, err := json.Marshal(message)
 	if err != nil {
-		return nil, uuid.Nil
+		log.Printf("Error marshaling WebSocket message: %v", err) // Use log package for simplicity here
+		return
 	}
-	var ownerID uuid.UUID
-	if uMap, ok := cardMap["user"].(map[string]interface{}); ok {
-		if uidStr, ok2 := uMap["id"].(string); ok2 {
-			if uid, e2 := uuid.Parse(uidStr); e2 == nil {
-				ownerID = uid
-			}
+
+	// Use a separate context for the write operation to avoid blocking the main read loop context
+	writeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // Increased timeout
+	defer cancel()
+
+	err = c.Write(writeCtx, websocket.MessageText, msgBytes)
+	if err != nil {
+		// Log errors, especially useful for diagnosing closed connections
+		status := websocket.CloseStatus(err)
+		if status != websocket.StatusNormalClosure && status != websocket.StatusGoingAway && !strings.Contains(err.Error(), "context deadline exceeded") {
+			log.Printf("Error writing WebSocket message: %v (Status: %d)", err, status)
+		} else if strings.Contains(err.Error(), "context deadline exceeded") {
+			log.Printf("Timeout writing WebSocket message: %v", err)
 		}
+		// Don't necessarily close connection here, read loop handles closure detection
 	}
-	var found *models.Card
-	for _, pl := range g.Players {
-		if pl.ID == ownerID {
-			for _, c := range pl.Hand {
-				if c.ID == cardID {
-					found = c
-					break
-				}
-			}
-			break
-		}
-	}
-	return found, ownerID
 }
 
-// swapTwoCards conducts a swap between two cards.
-func swapTwoCards(g *game.CambiaGame, userA uuid.UUID, cardAID uuid.UUID, userB uuid.UUID, cardBID uuid.UUID) {
-	var pA, pB *models.Player
-	for i := range g.Players {
-		if g.Players[i].ID == userA {
-			pA = g.Players[i]
-		} else if g.Players[i].ID == userB {
-			pB = g.Players[i]
-		}
-	}
-	if pA == nil || pB == nil {
-		return
-	}
-	var idxA, idxB = -1, -1
-	var cA, cB *models.Card
-	for i, c := range pA.Hand {
-		if c.ID == cardAID {
-			cA = c
-			idxA = i
-			break
-		}
-	}
-	for j, c := range pB.Hand {
-		if c.ID == cardBID {
-			cB = c
-			idxB = j
-			break
-		}
-	}
-	if cA == nil || cB == nil || idxA < 0 || idxB < 0 {
-		return
-	}
-	pA.Hand[idxA], pB.Hand[idxB] = cB, cA
+// sendWsError is a helper to send an error message back to the client.
+func sendWsError(ctx context.Context, c *websocket.Conn, errorMsg string) {
+	sendWsMessage(ctx, c, map[string]interface{}{
+		"type":    "error", // Consistent error type
+		"message": errorMsg,
+	})
 }
