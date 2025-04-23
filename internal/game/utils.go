@@ -1,3 +1,4 @@
+// internal/game/utils.go
 package game
 
 import (
@@ -5,13 +6,14 @@ import (
 	"log"
 )
 
-// convertEventToBytes marshals a GameEvent into JSON bytes. If an error occurs during
-// the marshal, it logs the error and returns a minimal "{}" to avoid runtime failures.
+// convertEventToBytes marshals a GameEvent into JSON bytes.
+// Logs a warning and returns empty JSON "{}" on marshalling error.
 func convertEventToBytes(ev GameEvent) []byte {
 	data, err := json.Marshal(ev)
 	if err != nil {
-		log.Printf("WARNING: failed to marshal GameEvent: %v", err)
-		return []byte("{}")
+		// Log detailed error including event type if possible
+		log.Printf("WARNING: Failed to marshal GameEvent type %s: %v", ev.Type, err)
+		return []byte("{}") // Return empty JSON to prevent downstream crashes
 	}
 	return data
 }

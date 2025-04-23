@@ -12,34 +12,38 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
-	"github.com/jason-s-yu/cambia/internal/game" // Use game package types
+	"github.com/jason-s-yu/cambia/internal/game"
 	"github.com/jason-s-yu/cambia/internal/models"
 	"github.com/sirupsen/logrus"
 )
 
 // GameMessage represents the structure for incoming WebSocket messages during the game phase.
-// It includes fields necessary for various actions defined in the spec.
 type GameMessage struct {
 	Type string `json:"type"`
 
-	// Used for single-card actions like discard, snap, replace
-	Card map[string]interface{} `json:"card,omitempty"` // Use map for flexibility
+	// Card represents the primary card involved in an action (discard, snap, replace, peek).
+	// Using map[string]interface{} allows flexibility in the client sending optional fields like idx.
+	Card map[string]interface{} `json:"card,omitempty"`
 
-	// Used for special actions involving two cards (swaps)
-	Card1 map[string]interface{} `json:"card1,omitempty"` // Use map
-	Card2 map[string]interface{} `json:"card2,omitempty"` // Use map
+	// Card1 and Card2 are used for special actions involving two cards (swaps).
+	Card1 map[string]interface{} `json:"card1,omitempty"`
+	Card2 map[string]interface{} `json:"card2,omitempty"`
 
-	// Used for special actions to specify the sub-action (e.g., "peek_self", "skip")
+	// Special identifies the specific sub-action for action_special messages
+	// (e.g., "peek_self", "skip", "swap_blind", "swap_peek_swap").
 	Special string `json:"special,omitempty"`
 
-	// Generic payload for extensibility, though spec uses top-level fields mostly
+	// Payload provides a generic container for any additional data, though most actions
+	// use specific top-level fields based on the specification.
 	Payload map[string]interface{} `json:"payload,omitempty"`
 }
 
-// GameWSHandler upgrades the connection and handles the game WebSocket lifecycle.
+// GameWSHandler upgrades the HTTP connection to WebSocket for a specific game instance.
+// It authenticates the user, verifies they belong to the game, registers the connection,
+// and then starts the read loop to handle incoming game messages.
 func GameWSHandler(logger *logrus.Logger, gs *GameServer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// 1. Extract Game ID from URL path
+		// Extract Game ID from URL path: /game/ws/{game_id}
 		pathParts := strings.Split(strings.TrimPrefix(r.URL.Path, "/game/ws/"), "/")
 		if len(pathParts) < 1 || pathParts[0] == "" {
 			http.Error(w, "Missing game_id in path (/game/ws/{game_id})", http.StatusBadRequest)
@@ -52,28 +56,27 @@ func GameWSHandler(logger *logrus.Logger, gs *GameServer) http.HandlerFunc {
 			return
 		}
 
-		// 2. Find the game instance in the GameServer's store
+		// Find the game instance.
 		g, ok := gs.GameStore.GetGame(gameID)
 		if !ok {
 			http.Error(w, "Game not found", http.StatusNotFound)
 			return
 		}
 		if g.GameOver {
-			http.Error(w, "Game has already ended", http.StatusGone) // 410 Gone might be appropriate
+			http.Error(w, "Game has already ended", http.StatusGone)
 			return
 		}
 
-		// 3. Upgrade WebSocket connection
+		// Upgrade WebSocket connection.
 		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			Subprotocols:   []string{"game"}, // Enforce "game" subprotocol
-			OriginPatterns: []string{"*"},    // Allow all origins (adjust for production)
+			Subprotocols:   []string{"game"},
+			OriginPatterns: []string{"*"}, // Adjust for production security.
 		})
 		if err != nil {
 			logger.Warnf("WebSocket accept error for game %s: %v", gameID, err)
-			// Error is implicitly sent by the websocket library
 			return
 		}
-		defer c.Close(websocket.StatusInternalError, "Internal server error during handler exit.") // Ensure closure on error/exit
+		defer c.Close(websocket.StatusInternalError, "Internal server error during handler exit.")
 
 		if c.Subprotocol() != "game" {
 			logger.Warnf("Client for game %s connected with invalid subprotocol: %s", gameID, c.Subprotocol())
@@ -82,8 +85,8 @@ func GameWSHandler(logger *logrus.Logger, gs *GameServer) http.HandlerFunc {
 		}
 		logger.Infof("WebSocket connection established for game %s from %s", gameID, r.RemoteAddr)
 
-		// 4. Authenticate user (reuse lobby logic or implement game-specific auth)
-		userID, err := EnsureEphemeralUser(w, r) // Assuming this handles JWT/ephemeral logic
+		// Authenticate user, potentially creating an ephemeral guest user.
+		userID, err := EnsureEphemeralUser(w, r)
 		if err != nil {
 			logger.Warnf("User authentication failed for game %s: %v", gameID, err)
 			c.Close(websocket.StatusPolicyViolation, "Authentication failed.")
@@ -91,7 +94,7 @@ func GameWSHandler(logger *logrus.Logger, gs *GameServer) http.HandlerFunc {
 		}
 		logger.Infof("User %s authenticated for game %s", userID, gameID)
 
-		// Check if player is actually part of this game
+		// Verify the authenticated user is a player in this specific game.
 		isPlayerInGame := false
 		g.Mu.Lock()
 		for _, p := range g.Players {
@@ -107,120 +110,121 @@ func GameWSHandler(logger *logrus.Logger, gs *GameServer) http.HandlerFunc {
 			return
 		}
 
-		// 5. Register broadcast functions if not already set
-		//    These need to be set up carefully to handle concurrency with the game lock.
-		g.Mu.Lock() // Lock game state before modifying broadcast functions or player list
+		// Register broadcast functions if they haven't been set up yet for this game instance.
+		// These functions handle sending events to clients, managing locks appropriately.
+		g.Mu.Lock()
 		if g.BroadcastFn == nil {
-			g.BroadcastFn = func(ev game.GameEvent) {
-				// This function will be called FROM within game logic (which holds the lock).
-				// We need to send messages without holding the lock to avoid blocking game state.
-				playersToSend := []*models.Player{}
-				for _, p := range g.Players { // Iterate safely while holding lock
-					if p.Connected && p.Conn != nil {
-						playersToSend = append(playersToSend, p) // Add connected players
-					}
-				}
-
-				// Prepare message bytes once.
-				msgBytes, err := json.Marshal(ev)
-				if err != nil {
-					logger.Errorf("Failed to marshal broadcast event (%s) for game %s: %v", ev.Type, g.ID, err)
-					return // Don't proceed if marshaling fails
-				}
-
-				// Send asynchronously outside the lock.
-				go func(players []*models.Player, data []byte, gameID uuid.UUID) {
-					for _, pl := range players {
-						// Double-check connection status *before* writing, outside lock
-						// It's possible player disconnected between lock release and write attempt.
-						if pl.Conn != nil {
-							ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second) // Timeout for write
-							err := pl.Conn.Write(ctx, websocket.MessageText, data)
-							cancel() // Ensure cancel is called regardless of error
-							if err != nil {
-								logger.Warnf("Failed to write broadcast message to player %s in game %s: %v", pl.ID, gameID, err)
-								// Trigger disconnect handling asynchronously if write fails
-								// Be cautious about triggering this too eagerly (e.g., temporary network issues)
-								// gs.GameStore.HandleDisconnectAsync(gameID, pl.ID) // Needs implementation
-							}
-						}
-					}
-				}(playersToSend, msgBytes, g.ID) // Pass game ID for logging
-			}
+			g.BroadcastFn = createBroadcastFunc(g, logger)
 		}
 		if g.BroadcastToPlayerFn == nil {
-			g.BroadcastToPlayerFn = func(targetPlayerID uuid.UUID, ev game.GameEvent) {
-				// Find the player while holding the lock
-				var targetConn *websocket.Conn
-				var targetPlayer *models.Player // Keep track of the player pointer
-				for _, pl := range g.Players {
-					if pl.ID == targetPlayerID {
-						targetPlayer = pl
-						if pl.Connected && pl.Conn != nil {
-							targetConn = pl.Conn
-						}
-						break
-					}
-				}
-
-				// If found and connected, send asynchronously outside the lock
-				if targetConn != nil {
-					msgBytes, err := json.Marshal(ev)
-					if err != nil {
-						logger.Errorf("Failed to marshal private event (%s) for player %s in game %s: %v", ev.Type, targetPlayerID, g.ID, err)
-						return
-					}
-					// Capture necessary variables for the goroutine
-					connToSend := targetConn
-					gameID := g.ID
-					go func(conn *websocket.Conn, data []byte, playerID uuid.UUID, gameID uuid.UUID) {
-						ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-						err := conn.Write(ctx, websocket.MessageText, data)
-						cancel()
-						if err != nil {
-							logger.Warnf("Failed to write private message to player %s in game %s: %v", playerID, gameID, err)
-							// Consider triggering disconnect handling
-							// gs.GameStore.HandleDisconnectAsync(gameID, playerID) // Needs implementation
-						}
-					}(connToSend, msgBytes, targetPlayerID, gameID) // Pass IDs for logging
-				} else if targetPlayer != nil {
-					// Log if player exists but isn't connected
-					// logger.Warnf("Could not send private message to disconnected player %s in game %s", targetPlayerID, g.ID)
-				} else {
-					// Log if player doesn't exist in the game at all
-					// logger.Warnf("Could not find player %s to send private message in game %s", targetPlayerID, g.ID)
-				}
-			}
+			g.BroadcastToPlayerFn = createBroadcastToPlayerFunc(g, logger)
 		}
-		g.Mu.Unlock() // Unlock after setting up broadcast functions
+		g.Mu.Unlock()
 
-		// 6. Handle player connection/reconnection in the game logic
-		// This needs the game lock internally. Pass the connection object.
-		g.HandleReconnect(userID, c)
+		// Handle player connection/reconnection within the game logic.
+		// This updates the player's connection status and sends initial state.
+		g.HandleReconnect(userID, c) // Needs game lock internally.
 
-		// 7. Start reading messages from the client
+		// Start reading messages from the client in a blocking loop.
 		ctx, cancel := context.WithCancel(r.Context())
-		defer cancel() // Ensure context cancellation on exit
+		defer cancel() // Ensure context cancellation propagates on exit.
 
-		// Run the read loop
 		readGameMessages(ctx, c, g, userID, logger)
 
-		// 8. Handle disconnection when readGameMessages returns
+		// Cleanup after readGameMessages returns (due to error, closure, or context cancellation).
 		logger.Infof("Player %s WebSocket read loop exited for game %s.", userID, gameID)
-		// Disconnect handling is now triggered by read error or context cancellation.
-		// Call HandleDisconnect directly here.
-		g.HandleDisconnect(userID)
-		// Close is deferred earlier
+		g.HandleDisconnect(userID) // Mark player as disconnected in game state.
 		logger.Infof("Player %s cleanup complete for game %s.", userID, gameID)
+		// The deferred c.Close handles the actual WebSocket closure.
 	}
 }
 
-// readGameMessages reads incoming messages from a single client WebSocket connection.
+// createBroadcastFunc returns a function suitable for CambiaGame.BroadcastFn.
+// It marshals the event and sends it asynchronously to all connected players.
+func createBroadcastFunc(g *game.CambiaGame, logger *logrus.Logger) func(ev game.GameEvent) {
+	return func(ev game.GameEvent) {
+		// This function is called *while the game lock is held*.
+		// We must release the lock before writing to WebSockets to avoid blocking game logic.
+
+		playersToSend := []*models.Player{}
+		g.Mu.Lock() // Acquire lock briefly to get current connected players.
+		for _, p := range g.Players {
+			if p.Connected && p.Conn != nil {
+				playersToSend = append(playersToSend, p)
+			}
+		}
+		g.Mu.Unlock() // Release lock before marshaling and sending.
+
+		msgBytes, err := json.Marshal(ev)
+		if err != nil {
+			logger.Errorf("Failed to marshal broadcast event (%s) for game %s: %v", ev.Type, g.ID, err)
+			return
+		}
+
+		// Send asynchronously.
+		go func(players []*models.Player, data []byte, gameID uuid.UUID) {
+			for _, pl := range players {
+				// Check connection status again *before* writing, as it might have changed.
+				if pl.Conn != nil {
+					ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second) // Write timeout.
+					err := pl.Conn.Write(ctx, websocket.MessageText, data)
+					cancel()
+					if err != nil {
+						logger.Warnf("Failed to write broadcast message to player %s in game %s: %v", pl.ID, gameID, err)
+						// Consider triggering disconnect handling more formally here if needed.
+					}
+				}
+			}
+		}(playersToSend, msgBytes, g.ID)
+	}
+}
+
+// createBroadcastToPlayerFunc returns a function suitable for CambiaGame.BroadcastToPlayerFn.
+// It finds the target player, marshals the event, and sends it asynchronously.
+func createBroadcastToPlayerFunc(g *game.CambiaGame, logger *logrus.Logger) func(targetPlayerID uuid.UUID, ev game.GameEvent) {
+	return func(targetPlayerID uuid.UUID, ev game.GameEvent) {
+		// This function is also called *while the game lock is held*.
+
+		var targetConn *websocket.Conn
+		g.Mu.Lock() // Acquire lock briefly to find the target connection.
+		for _, pl := range g.Players {
+			if pl.ID == targetPlayerID {
+				if pl.Connected && pl.Conn != nil {
+					targetConn = pl.Conn
+				}
+				break
+			}
+		}
+		g.Mu.Unlock() // Release lock before marshaling and sending.
+
+		if targetConn != nil {
+			msgBytes, err := json.Marshal(ev)
+			if err != nil {
+				logger.Errorf("Failed to marshal private event (%s) for player %s in game %s: %v", ev.Type, targetPlayerID, g.ID, err)
+				return
+			}
+			// Send asynchronously.
+			go func(conn *websocket.Conn, data []byte, playerID uuid.UUID, gameID uuid.UUID) {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				err := conn.Write(ctx, websocket.MessageText, data)
+				cancel()
+				if err != nil {
+					logger.Warnf("Failed to write private message to player %s in game %s: %v", playerID, gameID, err)
+				}
+			}(targetConn, msgBytes, targetPlayerID, g.ID)
+		}
+	}
+}
+
+// readGameMessages continuously reads messages from a client's WebSocket connection,
+// unmarshals them, validates the action based on game state, and routes them
+// to the appropriate game logic handler (HandlePlayerAction or ProcessSpecialAction).
+// It operates within the connection's context and exits upon error or cancellation.
 func readGameMessages(ctx context.Context, c *websocket.Conn, g *game.CambiaGame, userID uuid.UUID, logger *logrus.Logger) {
 	for {
 		msgType, data, err := c.Read(ctx)
 		if err != nil {
-			// Handle read errors (e.g., connection closed)
+			// Handle read errors (connection closed, context cancelled, etc.)
 			status := websocket.CloseStatus(err)
 			if status == websocket.StatusNormalClosure || status == websocket.StatusGoingAway {
 				logger.Infof("WebSocket closed normally for user %s in game %s.", userID, g.ID)
@@ -229,7 +233,7 @@ func readGameMessages(ctx context.Context, c *websocket.Conn, g *game.CambiaGame
 			} else {
 				logger.Warnf("Error reading from WebSocket for user %s in game %s: %v (Status: %d)", userID, g.ID, err, status)
 			}
-			return // Exit loop on read error/closure/cancelation
+			return // Exit loop on error/closure/cancelation.
 		}
 
 		if msgType != websocket.MessageText {
@@ -240,78 +244,72 @@ func readGameMessages(ctx context.Context, c *websocket.Conn, g *game.CambiaGame
 		var msg GameMessage
 		if err := json.Unmarshal(data, &msg); err != nil {
 			logger.Warnf("Invalid JSON received from user %s in game %s: %v. Data: %s", userID, g.ID, err, string(data))
-			// Optionally send an error back to the client
 			sendWsError(ctx, c, "Invalid JSON format.")
 			continue
 		}
 
 		logger.Debugf("Received action '%s' from user %s in game %s.", msg.Type, userID, g.ID)
 
-		// Acquire game lock before processing any action that modifies game state
+		// Acquire game lock before accessing or modifying game state.
 		g.Mu.Lock()
 
-		// --- Action Processing ---
-		// Check if game is over before processing action
+		// Check if game is over before processing action.
 		if g.GameOver {
 			logger.Warnf("Game %s is over. Ignoring action '%s' from user %s.", g.ID, msg.Type, userID)
-			g.Mu.Unlock() // Release lock
-			continue      // Ignore actions after game over
+			g.Mu.Unlock()
+			continue
 		}
 
+		// Route the message based on its type.
 		switch msg.Type {
-		// Actions handled by HandlePlayerAction
 		case "action_draw_stockpile", "action_draw_discardpile",
 			"action_discard", "action_replace", "action_cambia", "action_snap":
-			// Prepare the GameAction struct
+			// Prepare the GameAction struct for standard actions.
 			gameAction := models.GameAction{
 				ActionType: msg.Type,
 				Payload:    make(map[string]interface{}),
 			}
-			// Populate payload based on message structure
-			// For discard/replace/snap, payload comes from msg.Card
+			// Populate payload primarily from msg.Card if present, otherwise msg.Payload.
 			if msg.Card != nil {
-				gameAction.Payload = msg.Card // Pass the whole card object as payload
+				gameAction.Payload = msg.Card
 			} else if msg.Payload != nil {
-				// Fallback to generic payload if specific one isn't present
 				gameAction.Payload = msg.Payload
 			}
-			// Call the game logic handler (which assumes lock is held)
+			// Call the main action handler (assumes lock is held).
 			g.HandlePlayerAction(userID, gameAction)
 
-		// Special actions handled by ProcessSpecialAction
 		case "action_special":
-			// Call the dedicated special action processor (which assumes lock is held)
+			// Call the dedicated special action processor (assumes lock is held).
 			g.ProcessSpecialAction(userID, msg.Special, msg.Card1, msg.Card2)
 
 		case "ping":
-			// Handle ping immediately without holding the lock for the write
-			g.Mu.Unlock() // Release lock before writing
+			// Respond to ping immediately without holding the lock for the write.
+			g.Mu.Unlock() // Release lock before writing.
 			logger.Tracef("Received ping from user %s, sending pong.", userID)
 			sendWsMessage(ctx, c, map[string]string{"type": "pong"})
-			g.Mu.Lock() // Re-acquire lock after write (needed for loop consistency)
+			g.Mu.Lock() // Re-acquire lock after write for loop consistency.
 
 		default:
 			logger.Warnf("Unknown action type '%s' from user %s in game %s.", msg.Type, userID, g.ID)
-			// Send error back to client without releasing lock yet
 			sendWsError(ctx, c, fmt.Sprintf("Unknown action type: %s", msg.Type))
 		}
 
-		// Release the lock after processing the action for this iteration
+		// Release the lock after processing the action for this iteration.
 		g.Mu.Unlock()
-		// --- End Action Processing ---
 
-		// Check context cancellation after processing each message
+		// Check context cancellation after processing each message.
 		select {
 		case <-ctx.Done():
 			logger.Infof("Context canceled after processing message for user %s in game %s.", userID, g.ID)
-			return // Exit loop if context is cancelled
+			return // Exit loop if context is cancelled.
 		default:
-			// Continue to the next iteration
+			// Continue to the next read iteration.
 		}
 	}
 }
 
-// sendWsMessage is a helper to send a structured message to a WebSocket client.
+// sendWsMessage marshals a message and sends it to the WebSocket client.
+// Includes logging for errors and uses a write timeout.
 func sendWsMessage(ctx context.Context, c *websocket.Conn, message interface{}) {
 	if c == nil {
 		log.Println("Error: Attempted to send WebSocket message on nil connection.")
@@ -319,31 +317,30 @@ func sendWsMessage(ctx context.Context, c *websocket.Conn, message interface{}) 
 	}
 	msgBytes, err := json.Marshal(message)
 	if err != nil {
-		log.Printf("Error marshaling WebSocket message: %v", err) // Use log package for simplicity here
+		log.Printf("Error marshaling WebSocket message: %v", err)
 		return
 	}
 
-	// Use a separate context for the write operation to avoid blocking the main read loop context
-	writeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // Increased timeout
+	// Use a dedicated context with timeout for the write operation.
+	writeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	err = c.Write(writeCtx, websocket.MessageText, msgBytes)
 	if err != nil {
-		// Log errors, especially useful for diagnosing closed connections
 		status := websocket.CloseStatus(err)
 		if status != websocket.StatusNormalClosure && status != websocket.StatusGoingAway && !strings.Contains(err.Error(), "context deadline exceeded") {
 			log.Printf("Error writing WebSocket message: %v (Status: %d)", err, status)
 		} else if strings.Contains(err.Error(), "context deadline exceeded") {
 			log.Printf("Timeout writing WebSocket message: %v", err)
 		}
-		// Don't necessarily close connection here, read loop handles closure detection
+		// Let the read loop handle connection closure detection.
 	}
 }
 
-// sendWsError is a helper to send an error message back to the client.
+// sendWsError sends a structured error message to the client.
 func sendWsError(ctx context.Context, c *websocket.Conn, errorMsg string) {
 	sendWsMessage(ctx, c, map[string]interface{}{
-		"type":    "error", // Consistent error type
+		"type":    "error",
 		"message": errorMsg,
 	})
 }

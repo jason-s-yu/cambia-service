@@ -3,88 +3,103 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jason-s-yu/cambia/internal/auth"
 	"github.com/jason-s-yu/cambia/internal/database"
+	"github.com/jason-s-yu/cambia/internal/models"
 )
 
-// AddFriendHandler handles a user sending a friend request to another user.
-//
-// Request payload: { "friend_id": "some-uuid-string" }
-// We store a row in the friends table with status='pending'.
-func AddFriendHandler(w http.ResponseWriter, r *http.Request) {
+// authenticateAndGetUser performs JWT authentication and retrieves the user UUID.
+// It handles common authentication errors and returns the UUID or writes an HTTP error.
+func authenticateAndGetUser(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
 	cookieHeader := r.Header.Get("Cookie")
-	if !strings.Contains(cookieHeader, "auth_token=") {
-		http.Error(w, "missing auth_token", http.StatusUnauthorized)
-		return
+	token := extractCookieToken(cookieHeader, "auth_token")
+	if token == "" {
+		http.Error(w, "Missing authentication token", http.StatusUnauthorized)
+		return uuid.Nil, false
 	}
-	jwtToken := extractCookieToken(cookieHeader, "auth_token")
 
-	userIDStr, err := auth.AuthenticateJWT(jwtToken)
+	userIDStr, err := auth.AuthenticateJWT(token)
 	if err != nil {
-		http.Error(w, "invalid token", http.StatusForbidden)
-		return
+		http.Error(w, "Invalid or expired authentication token", http.StatusForbidden)
+		return uuid.Nil, false
 	}
+
 	userUUID, err := uuid.Parse(userIDStr)
 	if err != nil {
-		http.Error(w, "invalid user id in token", http.StatusBadRequest)
-		return
+		// This indicates an issue with the JWT generation or a corrupted token.
+		log.Printf("Error parsing user ID from valid token (%s): %v", userIDStr, err)
+		http.Error(w, "Invalid user ID format in token", http.StatusForbidden)
+		return uuid.Nil, false
+	}
+
+	return userUUID, true
+}
+
+// AddFriendHandler handles a user sending a friend request to another user.
+// It creates a pending friend relationship in the database.
+// Expects JSON: { "friend_id": "uuid-string" }
+func AddFriendHandler(w http.ResponseWriter, r *http.Request) {
+	userUUID, ok := authenticateAndGetUser(w, r)
+	if !ok {
+		return // Error already written by authenticateAndGetUser.
 	}
 
 	var req struct {
 		FriendID string `json:"friend_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid payload", http.StatusBadRequest)
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
 		return
 	}
 	friendUUID, err := uuid.Parse(req.FriendID)
 	if err != nil {
-		http.Error(w, "invalid friend_id", http.StatusBadRequest)
+		http.Error(w, "Invalid friend_id format", http.StatusBadRequest)
 		return
 	}
 
 	if userUUID == friendUUID {
-		http.Error(w, "cannot friend yourself", http.StatusBadRequest)
+		http.Error(w, "Cannot add yourself as a friend", http.StatusBadRequest)
 		return
 	}
 
 	ctx := r.Context()
 	err = database.InsertFriendRequest(ctx, userUUID, friendUUID)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to insert friend request: %v", err), http.StatusInternalServerError)
+		var pgErr *pgconn.PgError
+		// Handle potential foreign key constraint violation if friend_id doesn't exist.
+		if errors.As(err, &pgErr) && pgErr.Code == "23503" { // foreign_key_violation
+			http.Error(w, "Target user does not exist", http.StatusNotFound)
+			return
+		}
+		// Handle potential unique constraint violation if request already exists (even if pending).
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" { // unique_violation
+			http.Error(w, "Friend request already sent or relationship exists", http.StatusConflict)
+			return
+		}
+		log.Printf("Failed to insert friend request from %s to %s: %v", userUUID, friendUUID, err)
+		http.Error(w, "Failed to send friend request", http.StatusInternalServerError)
 		return
 	}
 
 	w.WriteHeader(http.StatusCreated)
-	w.Write([]byte("friend request sent"))
+	fmt.Fprintln(w, "Friend request sent successfully.")
 }
 
-// AcceptFriendHandler handles a user accepting a friend request that was sent to them.
-//
-// Request payload: { "friend_id": "some-uuid-string" }
-// This means the user with friend_id had previously called AddFriendHandler, and now
-// we set status='accepted' for (friend_id -> user).
+// AcceptFriendHandler handles a user accepting a pending friend request.
+// It updates the relationship status to 'accepted'.
+// Expects JSON: { "friend_id": "uuid-string" } where friend_id is the sender of the request.
 func AcceptFriendHandler(w http.ResponseWriter, r *http.Request) {
-	cookieHeader := r.Header.Get("Cookie")
-	if !strings.Contains(cookieHeader, "auth_token=") {
-		http.Error(w, "missing auth_token", http.StatusUnauthorized)
-		return
-	}
-	jwtToken := extractCookieToken(cookieHeader, "auth_token")
-
-	userIDStr, err := auth.AuthenticateJWT(jwtToken)
-	if err != nil {
-		http.Error(w, "invalid token", http.StatusForbidden)
-		return
-	}
-	userUUID, err := uuid.Parse(userIDStr)
-	if err != nil {
-		http.Error(w, "invalid user id in token", http.StatusBadRequest)
+	userUUID, ok := authenticateAndGetUser(w, r) // The user accepting the request.
+	if !ok {
 		return
 	}
 
@@ -92,77 +107,62 @@ func AcceptFriendHandler(w http.ResponseWriter, r *http.Request) {
 		FriendID string `json:"friend_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid payload", http.StatusBadRequest)
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
 		return
 	}
-	friendUUID, err := uuid.Parse(req.FriendID)
+	friendUUID, err := uuid.Parse(req.FriendID) // The user who sent the request.
 	if err != nil {
-		http.Error(w, "invalid friend_id", http.StatusBadRequest)
+		http.Error(w, "Invalid friend_id format", http.StatusBadRequest)
 		return
 	}
 
-	// The pending request was from friendUUID -> userUUID
+	// The database function expects (sender, receiver).
 	err = database.AcceptFriend(r.Context(), friendUUID, userUUID)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to accept friend: %v", err), http.StatusBadRequest)
+		// Check if the error indicates no pending request was found.
+		if errors.Is(err, pgx.ErrNoRows) || strings.Contains(err.Error(), "no pending friend request found") {
+			http.Error(w, "No pending friend request found from this user", http.StatusNotFound)
+		} else {
+			log.Printf("Failed to accept friend request from %s for user %s: %v", friendUUID, userUUID, err)
+			http.Error(w, "Failed to accept friend request", http.StatusInternalServerError)
+		}
 		return
 	}
 
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("friend request accepted"))
+	fmt.Fprintln(w, "Friend request accepted.")
 }
 
-// ListFriendsHandler returns a JSON array of all friend relationships (pending or accepted)
-// associated with the authenticated user.
+// ListFriendsHandler returns all friend relationships (pending or accepted) for the authenticated user.
 func ListFriendsHandler(w http.ResponseWriter, r *http.Request) {
-	cookieHeader := r.Header.Get("Cookie")
-	if !strings.Contains(cookieHeader, "auth_token=") {
-		http.Error(w, "missing auth_token", http.StatusUnauthorized)
-		return
-	}
-	jwtToken := extractCookieToken(cookieHeader, "auth_token")
-
-	userIDStr, err := auth.AuthenticateJWT(jwtToken)
-	if err != nil {
-		http.Error(w, "invalid token", http.StatusForbidden)
-		return
-	}
-	userUUID, err := uuid.Parse(userIDStr)
-	if err != nil {
-		http.Error(w, "invalid user id in token", http.StatusBadRequest)
+	userUUID, ok := authenticateAndGetUser(w, r)
+	if !ok {
 		return
 	}
 
 	ctx := r.Context()
 	friends, err := database.ListFriends(ctx, userUUID)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to list friends: %v", err), http.StatusInternalServerError)
+		log.Printf("Failed to list friends for user %s: %v", userUUID, err)
+		http.Error(w, "Failed to retrieve friends list", http.StatusInternalServerError)
 		return
+	}
+
+	// Return empty array instead of null if no friends.
+	if friends == nil {
+		friends = []models.Friend{}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(friends)
 }
 
-// RemoveFriendHandler handles removing (unfriending) a user.
-//
-// Request payload: { "friend_id": "some-uuid-string" }
+// RemoveFriendHandler handles removing a friend relationship or declining/canceling a request.
+// It deletes the corresponding row from the friends table.
+// Expects JSON: { "friend_id": "uuid-string" }
 func RemoveFriendHandler(w http.ResponseWriter, r *http.Request) {
-	cookieHeader := r.Header.Get("Cookie")
-	if !strings.Contains(cookieHeader, "auth_token=") {
-		http.Error(w, "missing auth_token", http.StatusUnauthorized)
-		return
-	}
-	jwtToken := extractCookieToken(cookieHeader, "auth_token")
-
-	userIDStr, err := auth.AuthenticateJWT(jwtToken)
-	if err != nil {
-		http.Error(w, "invalid token", http.StatusForbidden)
-		return
-	}
-	userUUID, err := uuid.Parse(userIDStr)
-	if err != nil {
-		http.Error(w, "invalid user id in token", http.StatusBadRequest)
+	userUUID, ok := authenticateAndGetUser(w, r)
+	if !ok {
 		return
 	}
 
@@ -170,20 +170,23 @@ func RemoveFriendHandler(w http.ResponseWriter, r *http.Request) {
 		FriendID string `json:"friend_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid payload", http.StatusBadRequest)
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
 		return
 	}
 	friendUUID, err := uuid.Parse(req.FriendID)
 	if err != nil {
-		http.Error(w, "invalid friend_id", http.StatusBadRequest)
+		http.Error(w, "Invalid friend_id format", http.StatusBadRequest)
 		return
 	}
 
 	err = database.RemoveFriend(r.Context(), userUUID, friendUUID)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to remove friend: %v", err), http.StatusInternalServerError)
+		log.Printf("Failed to remove friend relationship between %s and %s: %v", userUUID, friendUUID, err)
+		// Don't necessarily return 500 if the relationship didn't exist, 200 might be okay.
+		// However, a DB error during delete is likely a 500.
+		http.Error(w, "Failed to remove friend", http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("friend removed"))
+	fmt.Fprintln(w, "Friend removed or request canceled/declined.")
 }

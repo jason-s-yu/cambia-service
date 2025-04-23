@@ -5,46 +5,51 @@ import "fmt"
 
 // HouseRules defines optional game rules that can modify standard play.
 type HouseRules struct {
-	AllowDrawFromDiscardPile bool `json:"allowDrawFromDiscardPile"` // allow players to draw from the discard pile
-	AllowReplaceAbilities    bool `json:"allowReplaceAbilities"`    // allow cards discarded from a draw and replace to use their special abilities
-	SnapRace                 bool `json:"snapRace"`                 // only allow the first card snapped to succeed; all others get penalized
-	ForfeitOnDisconnect      bool `json:"forfeitOnDisconnect"`      // if a player disconnects, forfeit their game; if false, players can rejoin
-	PenaltyDrawCount         int  `json:"penaltyDrawCount"`         // num cards to draw on false snap
-	AutoKickTurnCount        int  `json:"autoKickTurnCount"`        // number of Cambia rounds to wait before auto-forfeiting a player that is nonresponsive
-	TurnTimerSec             int  `json:"turnTimerSec"`             // number of seconds to wait for a player to make a move; default is 15 sec
+	AllowDrawFromDiscardPile bool `json:"allowDrawFromDiscardPile"` // Allow players to draw from the discard pile instead of the stockpile.
+	AllowReplaceAbilities    bool `json:"allowReplaceAbilities"`    // Allow cards discarded via replacement to trigger their special abilities.
+	SnapRace                 bool `json:"snapRace"`                 // Only the first player to successfully snap gets the benefit; others are penalized.
+	ForfeitOnDisconnect      bool `json:"forfeitOnDisconnect"`      // If a player disconnects, their game is forfeited. If false, they can rejoin.
+	PenaltyDrawCount         int  `json:"penaltyDrawCount"`         // Number of cards to draw as penalty for an invalid snap.
+	AutoKickTurnCount        int  `json:"autoKickTurnCount"`        // Number of consecutive turns a player can time out before being kicked (0 disables).
+	TurnTimerSec             int  `json:"turnTimerSec"`             // Duration (in seconds) for each player's turn (0 disables timer).
 }
 
-// Update will update the house rules with the new rules provided.
-// If a rule is not set or defined, it will be ignored, and the old value will persist.
+// Update applies changes from a map to the HouseRules struct.
+// It validates input types and ranges where applicable.
 func (rules *HouseRules) Update(newRules map[string]interface{}) error {
 	var ok bool
 	var err error // Declare error variable
 
-	// Helper function to handle type assertion and assignment
+	// Helper function to handle type assertion and assignment for booleans.
 	assignBool := func(field *bool, key string) error {
 		if val, exists := newRules[key]; exists && val != nil {
 			*field, ok = val.(bool)
 			if !ok {
-				return fmt.Errorf("invalid type for %s", key)
+				return fmt.Errorf("invalid type for %s, expected boolean", key)
 			}
 		}
 		return nil
 	}
 
+	// Helper function to handle type assertion and assignment for integers.
 	assignInt := func(field *int, key string, minVal int, validationMsg string) error {
 		if val, exists := newRules[key]; exists && val != nil {
-			// JSON numbers are often float64, handle conversion
+			// JSON numbers are often float64, handle conversion gracefully.
 			var floatVal float64
 			floatVal, ok = val.(float64)
 			if !ok {
-				// Try int if float64 fails
+				// Try int if float64 fails.
 				var intVal int
 				intVal, ok = val.(int)
 				if !ok {
-					return fmt.Errorf("invalid type for %s", key)
+					return fmt.Errorf("invalid type for %s, expected number", key)
 				}
 				*field = intVal
 			} else {
+				// Check if float has fractional part before converting.
+				if floatVal != float64(int(floatVal)) {
+					return fmt.Errorf("invalid value for %s, must be a whole number", key)
+				}
 				*field = int(floatVal)
 			}
 
@@ -55,7 +60,7 @@ func (rules *HouseRules) Update(newRules map[string]interface{}) error {
 		return nil
 	}
 
-	// Apply updates using helpers
+	// Apply updates using helpers.
 	if err = assignBool(&rules.AllowDrawFromDiscardPile, "allowDrawFromDiscardPile"); err != nil {
 		return err
 	}
@@ -81,11 +86,11 @@ func (rules *HouseRules) Update(newRules map[string]interface{}) error {
 	return nil
 }
 
-// ParseRules converts a map of rules to a HouseRules struct. It will ensure the types are valid.
+// ParseRules is deprecated as HouseRules.Update provides the same functionality directly.
+// Keeping for potential compatibility but recommend direct use of Update.
+// Deprecated: Use the Update method directly on a HouseRules instance.
 func ParseRules(rules map[string]interface{}, current HouseRules) (HouseRules, error) {
-	// Create a copy to modify
 	houseRules := current
-	// Use the Update method on the copy
 	err := houseRules.Update(rules)
 	return houseRules, err
 }

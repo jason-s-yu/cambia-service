@@ -9,155 +9,145 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jason-s-yu/cambia/internal/cache" // Added for historian
+	"github.com/jason-s-yu/cambia/internal/cache"
 	"github.com/jason-s-yu/cambia/internal/database"
 	"github.com/jason-s-yu/cambia/internal/models"
 
-	"github.com/coder/websocket" // Import websocket
+	"github.com/coder/websocket"
 )
 
-// OnGameEndFunc is a function signature that can handle a finished game, broadcasting results to the lobby, etc.
+// OnGameEndFunc defines the signature for a callback function executed when a game ends.
+// It receives the lobby ID, the primary winner's ID (can be Nil), and the final scores.
 type OnGameEndFunc func(lobbyID uuid.UUID, winner uuid.UUID, scores map[uuid.UUID]int)
 
-// GameEventType is an enum-like type for broadcasting game actions.
-// Updated event types to match specification.
+// GameEventType represents the type of a game-related event broadcast via WebSockets.
 type GameEventType string
 
-// --- Event Type Definitions ---
+// Constants defining the various GameEvent types used for WebSocket communication.
 const (
 	EventPlayerSnapSuccess      GameEventType = "player_snap_success"
 	EventPlayerSnapFail         GameEventType = "player_snap_fail"
-	EventPlayerSnapPenalty      GameEventType = "player_snap_penalty"            // Public notification of penalty draw
-	EventPrivateSnapPenalty     GameEventType = "private_snap_penalty"           // Private notification of penalty card details
-	EventGameReshuffleStockpile GameEventType = "game_reshuffle_stockpile"       // Reshuffle notification
-	EventPlayerDrawStockpile    GameEventType = "player_draw_stockpile"          // Public draw notification
-	EventPrivateDrawStockpile   GameEventType = "private_draw_stockpile"         // Private draw details
-	EventPlayerDiscard          GameEventType = "player_discard"                 // Public discard notification (includes card details)
-	EventPlayerReplace          GameEventType = "player_replace"                 // Public notification of replace action (only drawn card id/idx) - DEPRECATED? Should send Discard event instead.
-	EventPlayerSpecialChoice    GameEventType = "player_special_choice"          // Notify player can use special ability
-	EventPlayerSpecialAction    GameEventType = "player_special_action"          // Public notification of special action taken (obfuscated)
-	EventPrivateSpecialSuccess  GameEventType = "private_special_action_success" // Private notification of successful special action (revealed details)
-	EventPrivateSpecialFail     GameEventType = "private_special_action_fail"    // Private notification of failed special action attempt
-	EventPlayerCambia           GameEventType = "player_cambia"                  // Public notification of Cambia call
-	EventGamePlayerTurn         GameEventType = "game_player_turn"               // Public notification of whose turn it is
-	EventPrivateSyncState       GameEventType = "private_sync_state"             // Private state sync on connect/reconnect
-	EventPrivateInitialCards    GameEventType = "private_initial_cards"          // Private reveal of initial cards
-	EventGameEnd                GameEventType = "game_end"                       // Public notification game has ended + results
+	EventPlayerSnapPenalty      GameEventType = "player_snap_penalty"            // Public: Player drew penalty cards.
+	EventPrivateSnapPenalty     GameEventType = "private_snap_penalty"           // Private: Details of penalty cards drawn.
+	EventGameReshuffleStockpile GameEventType = "game_reshuffle_stockpile"       // Public: Discard pile was reshuffled into stockpile.
+	EventPlayerDrawStockpile    GameEventType = "player_draw_stockpile"          // Public: Player drew a card (ID only).
+	EventPrivateDrawStockpile   GameEventType = "private_draw_stockpile"         // Private: Details of the card drawn.
+	EventPlayerDiscard          GameEventType = "player_discard"                 // Public: Player discarded a card (details revealed).
+	EventPlayerReplace          GameEventType = "player_replace"                 // DEPRECATED? Sends EventPlayerDiscard instead.
+	EventPlayerSpecialChoice    GameEventType = "player_special_choice"          // Public: Player can now use a special ability.
+	EventPlayerSpecialAction    GameEventType = "player_special_action"          // Public: Player used a special ability (obfuscated details).
+	EventPrivateSpecialSuccess  GameEventType = "private_special_action_success" // Private: Details of successful special action.
+	EventPrivateSpecialFail     GameEventType = "private_special_action_fail"    // Private: Special action attempt failed.
+	EventPlayerCambia           GameEventType = "player_cambia"                  // Public: Player called Cambia.
+	EventGamePlayerTurn         GameEventType = "game_player_turn"               // Public: Notification of the current player's turn.
+	EventPrivateSyncState       GameEventType = "private_sync_state"             // Private: Full game state sync for a player.
+	EventPrivateInitialCards    GameEventType = "private_initial_cards"          // Private: Initial two cards revealed during pre-game.
+	EventGameEnd                GameEventType = "game_end"                       // Public: Game has ended, includes results.
 )
 
-// --- Event Payload Struct Definitions ---
-
-// EventUser is used within GameEvent payloads for user identification.
+// EventUser identifies a user within a GameEvent payload.
 type EventUser struct {
 	ID uuid.UUID `json:"id"`
 }
 
-// EventCard is used within GameEvent payloads for card identification.
-// Includes optional Rank, Suit, Value, Idx for different event types.
+// EventCard identifies a card within a GameEvent payload, optionally including details.
 type EventCard struct {
 	ID    uuid.UUID  `json:"id"`
 	Rank  string     `json:"rank,omitempty"`
 	Suit  string     `json:"suit,omitempty"`
 	Value int        `json:"value,omitempty"`
-	Idx   *int       `json:"idx,omitempty"`  // Use pointer to allow omitting zero index
-	User  *EventUser `json:"user,omitempty"` // Added for special actions targeting specific users' cards
+	Idx   *int       `json:"idx,omitempty"`  // Index in hand, if relevant.
+	User  *EventUser `json:"user,omitempty"` // Owner of the card, if relevant (e.g., for swaps).
 }
 
-// REMOVED Placeholder: ObfGameState struct is defined in sync_state.go
-
-// GameEvent holds data about an event that can be broadcast to the clients in a consistent format.
-// Refined structure to better match specification.
+// GameEvent is the standard structure for broadcasting game state changes and actions.
 type GameEvent struct {
 	Type    GameEventType `json:"type"`
-	User    *EventUser    `json:"user,omitempty"`    // Use pointer for omitempty
-	Card    *EventCard    `json:"card,omitempty"`    // Use pointer for omitempty
-	Card1   *EventCard    `json:"card1,omitempty"`   // Use pointer for omitempty
-	Card2   *EventCard    `json:"card2,omitempty"`   // Use pointer for omitempty
-	Special string        `json:"special,omitempty"` // For special action events
+	User    *EventUser    `json:"user,omitempty"`    // The user initiating or targeted by the event.
+	Card    *EventCard    `json:"card,omitempty"`    // Primary card involved.
+	Card1   *EventCard    `json:"card1,omitempty"`   // First card in a two-card action (e.g., swap).
+	Card2   *EventCard    `json:"card2,omitempty"`   // Second card in a two-card action.
+	Special string        `json:"special,omitempty"` // Identifier for the specific special action (e.g., "peek_self").
 
-	// Use 'Payload' for miscellaneous fields instead of 'Other' for clarity
-	Payload map[string]interface{} `json:"payload,omitempty"`
+	Payload map[string]interface{} `json:"payload,omitempty"` // Additional arbitrary data.
 
-	// Added for state sync
-	State *ObfGameState `json:"state,omitempty"` // Use pointer
+	State *ObfGameState `json:"state,omitempty"` // Full obfuscated state for sync events.
 }
 
-// SpecialActionState holds temporary info about a pending special action.
-// e.g. a King might be in a multi-step: first peek, then decide to swap or skip.
+// SpecialActionState holds temporary information about a pending multi-step special action (e.g., King).
 type SpecialActionState struct {
-	Active        bool
-	PlayerID      uuid.UUID
-	CardRank      string // "K", "Q", "J", "7", "8", "9", "10"
-	FirstStepDone bool   // used for K to track if we've revealed 2 cards
-	Card1         *models.Card
-	Card1Owner    uuid.UUID
-	Card2         *models.Card
-	Card2Owner    uuid.UUID
+	Active        bool         // Is a special action currently pending?
+	PlayerID      uuid.UUID    // Which player must act?
+	CardRank      string       // Rank of the card that triggered the action ("K", "Q", etc.).
+	FirstStepDone bool         // For King: Has the initial peek step completed?
+	Card1         *models.Card // For King: First peeked card.
+	Card1Owner    uuid.UUID    // For King: Owner of the first peeked card.
+	Card2         *models.Card // For King: Second peeked card.
+	Card2Owner    uuid.UUID    // For King: Owner of the second peeked card.
 }
 
-// Circuit settings relevant to game logic (penalties, bonuses).
+// CircuitRules defines parameters for tournament-style play across multiple rounds.
 type CircuitRules struct {
-	TargetScore            int  `json:"target_score"`
-	WinBonus               int  `json:"winBonus"`
-	FalseCambiaPenalty     int  `json:"falseCambiaPenalty"`
-	FreezeUserOnDisconnect bool `json:"freezeUserOnDisconnect"`
+	TargetScore            int  `json:"targetScore"`            // Score limit to trigger elimination or end.
+	WinBonus               int  `json:"winBonus"`               // Bonus (usually negative) applied to winner's score.
+	FalseCambiaPenalty     int  `json:"falseCambiaPenalty"`     // Penalty added if Cambia caller doesn't win.
+	FreezeUserOnDisconnect bool `json:"freezeUserOnDisconnect"` // Prevent disconnected users from being auto-kicked.
 }
+
+// Circuit wraps the overall circuit settings.
 type Circuit struct {
-	Enabled bool         `json:"enabled"`
-	Mode    string       `json:"mode"`
-	Rules   CircuitRules `json:"rules"`
+	Enabled bool         `json:"enabled"` // Is circuit mode active?
+	Mode    string       `json:"mode"`    // Identifier for the circuit mode (e.g., "circuit_4p").
+	Rules   CircuitRules `json:"rules"`   // Specific rules for this circuit.
 }
 
-// CambiaGame holds the entire state for a single game instance in memory.
+// CambiaGame represents the state and logic for a single instance of the Cambia game.
 type CambiaGame struct {
-	ID      uuid.UUID
-	LobbyID uuid.UUID // references the lobby that spawned this game
+	ID      uuid.UUID // Unique identifier for this game instance.
+	LobbyID uuid.UUID // ID of the lobby that created this game.
 
-	HouseRules HouseRules // Use defined HouseRules struct
-	Circuit    Circuit    // Added Circuit settings
+	HouseRules HouseRules // Configurable game rules.
+	Circuit    Circuit    // Circuit mode settings.
 
-	Players     []*models.Player
-	Deck        []*models.Card
-	DiscardPile []*models.Card
+	Players     []*models.Player // List of players in the game.
+	Deck        []*models.Card   // The stockpile deck.
+	DiscardPile []*models.Card   // The discard pile.
 
-	// Turn logic
-	CurrentPlayerIndex int
-	TurnID             int // Increments each turn
-	TurnDuration       time.Duration
-	turnTimer          *time.Timer
-	actionIndex        int // Increments for each game action for historian
+	// Turn Management
+	CurrentPlayerIndex int           // Index of the current player in the Players slice.
+	TurnID             int           // Increments each turn, useful for state synchronization and checks.
+	TurnDuration       time.Duration // Configurable duration for each turn timer.
+	turnTimer          *time.Timer   // Active timer for the current turn.
+	actionIndex        int           // Sequential index for logging actions via historian.
 
-	Started       bool
-	GameOver      bool
-	PreGameActive bool // Added flag for pre-game phase
-	lastSeen      map[uuid.UUID]time.Time
-	Mu            sync.Mutex
+	// Game Lifecycle State
+	Started       bool // Has the game started (after pre-game)?
+	GameOver      bool // Has the game finished?
+	PreGameActive bool // Is the initial pre-game card reveal phase active?
 
-	// BroadcastFn is used to send events to all players. If nil, no broadcast is done.
-	BroadcastFn func(ev GameEvent)
+	lastSeen map[uuid.UUID]time.Time // Tracks last activity time for players (potential future use).
+	Mu       sync.Mutex              // Mutex protecting concurrent access to game state.
 
-	// BroadcastToPlayerFn sends an event to a single specific player.
-	BroadcastToPlayerFn func(playerID uuid.UUID, ev GameEvent)
+	// Communication Callbacks
+	BroadcastFn         func(ev GameEvent)                     // Sends an event to all connected players.
+	BroadcastToPlayerFn func(playerID uuid.UUID, ev GameEvent) // Sends an event to a single player.
+	OnGameEnd           OnGameEndFunc                          // Callback executed when the game finishes.
 
-	// OnGameEnd is invoked at game end to broadcast results, etc.
-	OnGameEnd OnGameEndFunc
+	// Special Action State
+	SpecialAction SpecialActionState // Holds state for pending multi-step special actions.
 
-	// SpecialAction is used for multi-step card logic (K, Q, J, etc.)
-	SpecialAction SpecialActionState
+	// Cambia State
+	CambiaCalled   bool      // Has Cambia been called in this game?
+	CambiaCallerID uuid.UUID // ID of the player who called Cambia.
 
-	// Cambia-called tracking
-	CambiaCalled       bool
-	CambiaCallerID     uuid.UUID
-	CambiaFinalCounter int // Tracks turns after Cambia called - DEPRECATED? Logic moved to advanceTurn
+	// Snap State
+	snapUsedForThisDiscard bool // Tracks if a snap has succeeded for the current discard (used for SnapRace rule).
 
-	// Snap usage
-	snapUsedForThisDiscard bool // Used for SnapRace rule
-
-	// Timer that schedules the real start after pre-game
-	preGameTimer *time.Timer
+	// Timers
+	preGameTimer *time.Timer // Timer controlling the duration of the pre-game phase.
 }
 
-// NewCambiaGame builds an empty instance with a newly shuffled deck.
+// NewCambiaGame creates a new game instance with a shuffled deck and default settings.
 func NewCambiaGame() *CambiaGame {
 	id, _ := uuid.NewRandom()
 	g := &CambiaGame{
@@ -166,107 +156,101 @@ func NewCambiaGame() *CambiaGame {
 		DiscardPile:            []*models.Card{},
 		lastSeen:               make(map[uuid.UUID]time.Time),
 		CurrentPlayerIndex:     0,
-		TurnDuration:           15 * time.Second, // Default, can be overridden by HouseRules
+		TurnDuration:           15 * time.Second, // Default turn duration.
 		snapUsedForThisDiscard: false,
-		actionIndex:            0, // Start action counter
-		TurnID:                 0, // Start turn counter
-		// Initialize HouseRules with defaults
+		actionIndex:            0,
+		TurnID:                 0,
+		// Initialize HouseRules with standard defaults.
 		HouseRules: HouseRules{
 			AllowDrawFromDiscardPile: false,
 			AllowReplaceAbilities:    false,
 			SnapRace:                 false,
 			ForfeitOnDisconnect:      true,
-			PenaltyDrawCount:         2, // Default penalty is 2
-			AutoKickTurnCount:        3, // Default kick count
+			PenaltyDrawCount:         2,
+			AutoKickTurnCount:        3,
 			TurnTimerSec:             15,
 		},
-		// Initialize Circuit with defaults if needed
-		Circuit: Circuit{Enabled: false},
+		Circuit: Circuit{Enabled: false}, // Circuit mode disabled by default.
 	}
 	g.initializeDeck()
 	return g
 }
 
-// BeginPreGame deals each player 4 cards, broadcasts each player's two closest cards (idx 0,1).
-// Then starts a 10s timer. Once done, StartGame() is invoked.
+// BeginPreGame starts the initial phase where players see their first two cards.
+// Deals cards and schedules the transition to the main game start.
 func (g *CambiaGame) BeginPreGame() {
 	g.Mu.Lock()
 	defer g.Mu.Unlock()
 
 	if g.Started || g.GameOver || g.PreGameActive {
+		log.Printf("Game %s: BeginPreGame called in invalid state (Started:%v, Over:%v, PreGame:%v).", g.ID, g.Started, g.GameOver, g.PreGameActive)
 		return
 	}
 	g.PreGameActive = true
-	g.logAction(uuid.Nil, "game_pregame_start", nil) // Log pregame start
+	g.logAction(uuid.Nil, "game_pregame_start", nil)
 
-	// Default turn duration from house rules if set
+	// Apply turn duration from house rules.
 	if g.HouseRules.TurnTimerSec > 0 {
 		g.TurnDuration = time.Duration(g.HouseRules.TurnTimerSec) * time.Second
+	} else {
+		g.TurnDuration = 0 // Disable timer if set to 0.
 	}
 
-	// Deal 4 cards each
+	// Deal 4 cards to each player.
 	for _, p := range g.Players {
 		p.Hand = make([]*models.Card, 0, 4)
 		for i := 0; i < 4; i++ {
-			// Use internal draw without broadcasting events yet
-			card := g.internalDrawStockpile()
+			card := g.internalDrawStockpile() // Draw internally without broadcasts.
 			if card == nil {
-				log.Printf("Warning: Ran out of cards during initial deal for game %s", g.ID)
-				// Decide game rules: end game? continue? For now, just log.
-				break // Stop dealing to this player
+				log.Printf("Warning: Game %s ran out of cards during initial deal for player %s.", g.ID, p.ID)
+				break // Stop dealing to this player if deck empty.
 			}
 			p.Hand = append(p.Hand, card)
 		}
 	}
 
-	// Persist initial state after dealing
+	// Persist initial state for potential replay/audit.
 	g.persistInitialGameState()
 
-	// For each player: privately reveal their idx=0 and idx=1 cards
+	// Privately reveal the two closest cards (indices 0, 1) to each player.
 	for _, p := range g.Players {
-		if g.BroadcastToPlayerFn == nil { // Check if broadcast function is set
-			continue
-		}
-		if len(p.Hand) >= 2 { // Ensure player has at least 2 cards
-			c0 := p.Hand[0]
-			idx0 := 0
-			c1 := p.Hand[1]
-			idx1 := 1
+		if len(p.Hand) >= 2 {
+			c0, idx0 := p.Hand[0], 0
+			c1, idx1 := p.Hand[1], 1
 			g.firePrivateInitialCards(p.ID,
-				buildEventCard(c0, &idx0, p.ID, true), // Pass p.ID as owner, reveal private info
-				buildEventCard(c1, &idx1, p.ID, true), // Pass p.ID as owner, reveal private info
+				buildEventCard(c0, &idx0, p.ID, true),
+				buildEventCard(c1, &idx1, p.ID, true),
 			)
+		} else if len(p.Hand) == 1 { // Handle case where player only got 1 card.
+			c0, idx0 := p.Hand[0], 0
+			g.firePrivateInitialCards(p.ID, buildEventCard(c0, &idx0, p.ID, true), nil)
 		} else {
-			log.Printf("Warning: Player %s has less than 2 cards during pregame reveal.", p.ID)
-			// If they have 1 card, reveal that one?
-			if len(p.Hand) == 1 {
-				c0 := p.Hand[0]
-				idx0 := 0
-				g.firePrivateInitialCards(p.ID,
-					buildEventCard(c0, &idx0, p.ID, true),
-					nil, // No second card
-				)
-			}
+			log.Printf("Warning: Player %s has 0 cards during pregame reveal in game %s.", p.ID, g.ID)
+			g.firePrivateInitialCards(p.ID, nil, nil) // Send event indicating no cards shown.
 		}
 	}
 
-	// Start a 10-second timer that transitions from pre-game => in-progress
-	g.preGameTimer = time.AfterFunc(10*time.Second, func() {
-		g.StartGame() // This will acquire the lock again
+	// Schedule the transition to the main game phase.
+	preGameDuration := 10 * time.Second // Standard pre-game duration.
+	g.preGameTimer = time.AfterFunc(preGameDuration, func() {
+		g.StartGame() // Call StartGame after the timer.
 	})
+	log.Printf("Game %s: Pre-game phase started. Will transition in %s.", g.ID, preGameDuration)
 }
 
-// StartGame finalizes the pre-game stage and begins the normal turn cycle.
+// StartGame transitions the game from the pre-game phase to active play.
+// It marks the game as started and initiates the first turn.
 func (g *CambiaGame) StartGame() {
 	g.Mu.Lock()
 	defer g.Mu.Unlock()
 
-	// Check states again after acquiring lock
+	// Ensure StartGame is called in the correct state.
 	if g.GameOver || g.Started || !g.PreGameActive {
-		log.Printf("StartGame called in invalid state (GameOver:%v, Started:%v, PreGameActive:%v) for game %s", g.GameOver, g.Started, g.PreGameActive, g.ID)
+		log.Printf("Game %s: StartGame called in invalid state (GameOver:%v, Started:%v, PreGameActive:%v). Ignoring.", g.ID, g.GameOver, g.Started, g.PreGameActive)
 		return
 	}
-	// Stop pre-game timer if it hasn't fired yet
+
+	// Stop the pre-game timer if it's still running.
 	if g.preGameTimer != nil {
 		g.preGameTimer.Stop()
 		g.preGameTimer = nil
@@ -274,20 +258,22 @@ func (g *CambiaGame) StartGame() {
 
 	g.PreGameActive = false
 	g.Started = true
-	log.Printf("Game %v started.", g.ID)
-	g.logAction(uuid.Nil, "game_start", nil) // Log game start
+	log.Printf("Game %s: Started.", g.ID)
+	g.logAction(uuid.Nil, "game_start", nil)
 
+	// Start the turn cycle.
 	g.scheduleNextTurnTimer()
 	g.broadcastPlayerTurn()
 }
 
-// Start is left for backward compatibility, call BeginPreGame() => StartGame().
-// Deprecated: Use BeginPreGame() instead.
+// Start is deprecated. Use BeginPreGame instead to initiate the game flow.
+// Deprecated: Use BeginPreGame() which handles the pre-game reveal and timer.
 func (g *CambiaGame) Start() {
-	g.BeginPreGame() // Automatically transitions after 10s or when StartGame is called
+	g.BeginPreGame()
 }
 
-// firePrivateInitialCards sends the 2 revealed cards for a player's pre-game reveal (idx 0,1).
+// firePrivateInitialCards sends the initial card reveal event to a specific player.
+// Assumes lock is held by caller.
 func (g *CambiaGame) firePrivateInitialCards(playerID uuid.UUID, card1, card2 *EventCard) {
 	if g.BroadcastToPlayerFn == nil {
 		log.Println("Warning: BroadcastToPlayerFn is nil, cannot send private initial cards.")
@@ -295,221 +281,228 @@ func (g *CambiaGame) firePrivateInitialCards(playerID uuid.UUID, card1, card2 *E
 	}
 	ev := GameEvent{
 		Type:  EventPrivateInitialCards,
-		Card1: card1,
+		Card1: card1, // EventCard struct already contains details.
 		Card2: card2,
 	}
 	g.BroadcastToPlayerFn(playerID, ev)
 }
 
-// persistInitialGameState saves the entire deck order and each player's initial 4 cards into games.initial_game_state.
-// This is used so a replay can reconstruct the original deck and hands. This does not do obfuscation.
+// persistInitialGameState saves the initial deck order and player hands to the database.
+// Assumes lock is held by caller.
 func (g *CambiaGame) persistInitialGameState() {
+	// Structure for saving initial state.
 	type initialState struct {
 		Deck    []*models.Card            `json:"deck"`
-		Players map[string][]*models.Card `json:"players"` // Use string key for JSON
+		Players map[string][]*models.Card `json:"players"` // Use string UUID as JSON key.
 	}
 
-	// Create snapshot safely within lock
+	// Create snapshot safely.
 	snap := initialState{
 		Deck:    make([]*models.Card, len(g.Deck)),
 		Players: make(map[string][]*models.Card),
 	}
-	copy(snap.Deck, g.Deck) // Copy deck state
+	copy(snap.Deck, g.Deck)
 
 	for _, p := range g.Players {
 		handCopy := make([]*models.Card, len(p.Hand))
 		copy(handCopy, p.Hand)
-		snap.Players[p.ID.String()] = handCopy // Use string UUID as key
+		snap.Players[p.ID.String()] = handCopy
 	}
 
-	// Persist asynchronously
+	// Persist asynchronously to avoid blocking game thread.
 	go database.UpsertInitialGameState(g.ID, snap)
 	g.logAction(uuid.Nil, "game_initial_state_saved", map[string]interface{}{"deckSize": len(snap.Deck)})
 }
 
-// AddPlayer adds a player to the game or updates their connection status if they already exist.
+// AddPlayer adds a player to the game if not started, or marks them as reconnected.
+// Assumes lock is held by caller.
 func (g *CambiaGame) AddPlayer(p *models.Player) {
-	g.Mu.Lock()
-	defer g.Mu.Unlock()
 	found := false
 	for i, pl := range g.Players {
 		if pl.ID == p.ID {
-			// Player reconnecting
+			// Player reconnecting.
 			g.Players[i].Conn = p.Conn
 			g.Players[i].Connected = true
+			g.Players[i].User = p.User // Update user info.
 			g.lastSeen[p.ID] = time.Now()
-			log.Printf("Player %s reconnected to game %s", p.ID, g.ID)
+			log.Printf("Game %s: Player %s (%s) reconnected.", g.ID, p.ID, p.User.Username)
 			found = true
+			// Send sync state on reconnect (handled by HandleReconnect).
 			break
 		}
 	}
 	if !found {
-		// New player joining (only possible before game starts usually)
+		// New player joining (only possible before game starts).
 		if !g.Started && !g.PreGameActive {
 			g.Players = append(g.Players, p)
 			g.lastSeen[p.ID] = time.Now()
-			log.Printf("Player %s added to game %s", p.ID, g.ID)
+			log.Printf("Game %s: Player %s (%s) added.", g.ID, p.ID, p.User.Username)
 		} else {
-			log.Printf("Player %s cannot be added to game %s because it has already started.", p.ID, g.ID)
-			// Optionally send an error back to the player?
-			return // Prevent adding player mid-game unless rules allow
+			log.Printf("Game %s: Player %s (%s) cannot be added because game has already started.", g.ID, p.ID, p.User.Username)
+			// Optionally close connection or send error.
+			if p.Conn != nil {
+				p.Conn.Close(websocket.StatusPolicyViolation, "Game already in progress.")
+			}
+			return
 		}
 	}
-	// Log add/reconnect attempt regardless
-	g.logAction(p.ID, "player_add", map[string]interface{}{"reconnect": found})
+	g.logAction(p.ID, "player_add", map[string]interface{}{"reconnect": found, "username": p.User.Username})
 }
 
-// initializeDeck sets up a standard Cambia deck, including jokers, red kings = -1, etc.
+// initializeDeck creates and shuffles a standard 52-card deck plus two jokers.
+// Assigns Cambia-specific values (e.g., Red Kings = -1, Jokers = 0).
+// Assumes lock is held by caller.
 func (g *CambiaGame) initializeDeck() {
-	suits := []string{"H", "D", "C", "S"} // Use single letter suits
+	suits := []string{"H", "D", "C", "S"} // Hearts, Diamonds, Clubs, Spades.
 	ranks := []string{"A", "2", "3", "4", "5", "6", "7", "8", "9", "T", "J", "Q", "K"}
 	values := map[string]int{
 		"A": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8,
-		"9": 9, "T": 10, "J": 11, "Q": 12, "K": 13, // Default King value
+		"9": 9, "T": 10, "J": 11, "Q": 12, "K": 13, // Default King value.
 	}
 
 	var deck []*models.Card
-	// Add standard cards
+	// Add standard cards.
 	for _, suit := range suits {
 		for _, rank := range ranks {
 			val := values[rank]
-			// Red Kings (Hearts, Diamonds) have value -1
+			// Red Kings (Hearts, Diamonds) have value -1.
 			if rank == "K" && (suit == "H" || suit == "D") {
 				val = -1
 			}
 			cid, _ := uuid.NewRandom()
-			card := &models.Card{ID: cid, Suit: suit, Rank: rank, Value: val}
-			deck = append(deck, card)
+			deck = append(deck, &models.Card{ID: cid, Suit: suit, Rank: rank, Value: val})
 		}
 	}
-	// Add Jokers (value 0)
-	jokerSuits := []string{"R", "B"} // Red Joker, Black Joker
+	// Add Jokers (value 0).
+	jokerSuits := []string{"R", "B"} // Red Joker, Black Joker.
 	for _, suit := range jokerSuits {
 		cid, _ := uuid.NewRandom()
-		// Use rank "O" for Joker (avoids conflict with Jack "J")
+		// Use rank "O" for Joker to avoid confusion with Jack ("J").
 		deck = append(deck, &models.Card{ID: cid, Suit: suit, Rank: "O", Value: 0})
 	}
 
-	// Shuffle the deck
-	r := rand.New(rand.NewSource(time.Now().UnixNano())) // Use time-seeded random source
-	r.Shuffle(len(deck), func(i, j int) {
-		deck[i], deck[j] = deck[j], deck[i]
-	})
+	// Shuffle the deck using a time-seeded random source.
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	r.Shuffle(len(deck), func(i, j int) { deck[i], deck[j] = deck[j], deck[i] })
+
 	g.Deck = deck
-	log.Printf("Initialized and shuffled deck for game %s with %d cards.", g.ID, len(g.Deck))
+	log.Printf("Game %s: Initialized and shuffled deck with %d cards.", g.ID, len(g.Deck))
 }
 
-// internalDrawStockpile draws the top card from the stockpile, handling reshuffle internally.
-// This version does NOT broadcast events, intended for setup or internal logic.
-// Assumes lock is held.
+// internalDrawStockpile draws a card from the stockpile, handling reshuffles.
+// Returns the drawn card or nil if no cards are available.
+// Does NOT broadcast events.
+// Assumes lock is held by caller.
 func (g *CambiaGame) internalDrawStockpile() *models.Card {
-	if len(g.Deck) == 0 { // Check if deck is empty *before* checking discard pile size
-		if len(g.DiscardPile) == 0 {
-			log.Printf("Game %s: Stockpile and discard pile are empty. Cannot draw.", g.ID)
-			// Consider ending the game if no cards can be drawn
-			g.EndGame() // Uncomment if desired
+	if len(g.Deck) == 0 {
+		if len(g.DiscardPile) <= 1 { // Need at least 2 cards in discard to reshuffle (leave top).
+			log.Printf("Game %s: Stockpile empty and discard pile has %d card(s). Cannot draw.", g.ID, len(g.DiscardPile))
+			if !g.GameOver { // End game only if not already over.
+				g.EndGame()
+			}
 			return nil
 		}
-		// Reshuffle discard pile into stockpile
-		log.Printf("Game %s: Stockpile empty. Reshuffling %d card(s) from discard pile.", g.ID, len(g.DiscardPile))
+		// Reshuffle discard pile (excluding top card) into stockpile.
+		log.Printf("Game %s: Stockpile empty. Reshuffling %d card(s) from discard pile.", g.ID, len(g.DiscardPile)-1)
 
-		// Temporarily store the top card if needed (e.g., if top is not reshuffled)
-		// topDiscard := g.DiscardPile[len(g.DiscardPile)-1] // Not standard rule
-		// g.DiscardPile = g.DiscardPile[:len(g.DiscardPile)-1] // Exclude top
+		topDiscard := g.DiscardPile[len(g.DiscardPile)-1]
+		cardsToShuffle := g.DiscardPile[:len(g.DiscardPile)-1]
 
-		g.Deck = append(g.Deck, g.DiscardPile...) // Add discard pile cards to deck
-		g.DiscardPile = []*models.Card{}          // Clear discard pile
+		g.Deck = append(g.Deck, cardsToShuffle...)
+		g.DiscardPile = []*models.Card{topDiscard} // Keep only the top card.
 
+		// Shuffle the newly added cards.
 		r := rand.New(rand.NewSource(time.Now().UnixNano()))
-		r.Shuffle(len(g.Deck), func(i, j int) { // Shuffle the combined deck
-			g.Deck[i], g.Deck[j] = g.Deck[j], g.Deck[i]
-		})
+		r.Shuffle(len(g.Deck), func(i, j int) { g.Deck[i], g.Deck[j] = g.Deck[j], g.Deck[i] })
 		log.Printf("Game %s: Reshuffled discard pile into stockpile. New size: %d", g.ID, len(g.Deck))
 
-		// Broadcast reshuffle event
+		// Broadcast reshuffle event.
 		g.fireEvent(GameEvent{
-			Type: EventGameReshuffleStockpile,
-			Payload: map[string]interface{}{
-				"stockpileSize": len(g.Deck),
-			},
+			Type:    EventGameReshuffleStockpile,
+			Payload: map[string]interface{}{"stockpileSize": len(g.Deck)},
 		})
 		g.logAction(uuid.Nil, string(EventGameReshuffleStockpile), map[string]interface{}{"newSize": len(g.Deck)})
 	}
 
-	// After potential reshuffle, check again if deck is empty
+	// After potential reshuffle, check again if deck is empty.
 	if len(g.Deck) == 0 {
 		log.Printf("Game %s: Stockpile is still empty after attempting reshuffle. Cannot draw.", g.ID)
-		g.EndGame() // Game likely cannot continue
+		if !g.GameOver {
+			g.EndGame()
+		}
 		return nil
 	}
 
-	// Draw the top card
+	// Draw the top card.
 	card := g.Deck[0]
-	g.Deck = g.Deck[1:] // Remove card from deck
+	g.Deck = g.Deck[1:] // Remove card from deck.
 	return card
 }
 
-// drawTopStockpile draws the top card, handles reshuffle, AND broadcasts events.
-// Assumes lock is held.
+// drawTopStockpile draws from stockpile, broadcasts events, and returns the card.
+// Assumes lock is held by caller.
 func (g *CambiaGame) drawTopStockpile(playerID uuid.UUID) *models.Card {
-	card := g.internalDrawStockpile() // Use internal logic first
+	card := g.internalDrawStockpile()
 	if card == nil {
-		// internalDrawStockpile already logs/ends game if needed
-		return nil
+		return nil // internalDrawStockpile handles logging/game end.
 	}
 
-	// Broadcast public draw event (obfuscated card ID)
+	// Public draw event (obfuscated ID).
 	g.fireEvent(GameEvent{
 		Type: EventPlayerDrawStockpile,
 		User: &EventUser{ID: playerID},
-		Card: &EventCard{ID: card.ID}, // Only reveal ID publicly
+		Card: &EventCard{ID: card.ID},
 		Payload: map[string]interface{}{
 			"stockpileSize": len(g.Deck),
+			"source":        "stockpile", // Indicate source.
 		},
 	})
 
-	// Broadcast private draw event (full card details)
+	// Private draw event (full card details).
 	g.fireEventToPlayer(playerID, GameEvent{
 		Type: EventPrivateDrawStockpile,
 		Card: &EventCard{ID: card.ID, Rank: card.Rank, Suit: card.Suit, Value: card.Value},
+		Payload: map[string]interface{}{
+			"source": "stockpile",
+		},
 	})
 
 	g.logAction(playerID, string(EventPlayerDrawStockpile), map[string]interface{}{"cardId": card.ID, "newSize": len(g.Deck)})
 	return card
 }
 
-// drawTopDiscard draws from the top of the discard if allowed and non-empty. Broadcasts events.
-// Assumes lock is held.
+// drawTopDiscard draws from discard pile if allowed, broadcasts events, and returns the card.
+// Assumes lock is held by caller.
 func (g *CambiaGame) drawTopDiscard(playerID uuid.UUID) *models.Card {
 	if !g.HouseRules.AllowDrawFromDiscardPile {
-		log.Printf("Game %s: Player %s attempted to draw from discard pile, but house rule disallowed.", g.ID, playerID)
+		log.Printf("Game %s: Player %s tried to draw from discard, but rule disallows.", g.ID, playerID)
 		g.fireEventToPlayer(playerID, GameEvent{Type: EventPrivateSpecialFail, Payload: map[string]interface{}{"message": "Drawing from discard pile is not allowed."}})
 		return nil
 	}
 	if len(g.DiscardPile) == 0 {
-		log.Printf("Game %s: Player %s attempted to draw from empty discard pile.", g.ID, playerID)
+		log.Printf("Game %s: Player %s tried to draw from empty discard pile.", g.ID, playerID)
 		g.fireEventToPlayer(playerID, GameEvent{Type: EventPrivateSpecialFail, Payload: map[string]interface{}{"message": "Discard pile is empty."}})
 		return nil
 	}
 
 	idx := len(g.DiscardPile) - 1
 	card := g.DiscardPile[idx]
-	g.DiscardPile = g.DiscardPile[:idx] // Remove card from discard
+	g.DiscardPile = g.DiscardPile[:idx] // Remove card from discard.
 
-	// Broadcast public draw event (reveals card details as it came from discard)
+	// Public draw event (reveals details as it came from discard).
 	g.fireEvent(GameEvent{
-		Type: EventPlayerDrawStockpile, // Use same public event as drawing from stockpile
+		Type: EventPlayerDrawStockpile, // Reuse public event type.
 		User: &EventUser{ID: playerID},
-		Card: &EventCard{ID: card.ID, Rank: card.Rank, Suit: card.Suit, Value: card.Value}, // Reveal details
+		Card: &EventCard{ID: card.ID, Rank: card.Rank, Suit: card.Suit, Value: card.Value},
 		Payload: map[string]interface{}{
-			"source":      "discardpile", // Indicate source
+			"source":      "discardpile",
 			"discardSize": len(g.DiscardPile),
 		},
 	})
 
-	// Broadcast private draw event (also full card details)
+	// Private draw event (also full details).
 	g.fireEventToPlayer(playerID, GameEvent{
-		Type: EventPrivateDrawStockpile, // Use same private event
+		Type: EventPrivateDrawStockpile, // Reuse private event type.
 		Card: &EventCard{ID: card.ID, Rank: card.Rank, Suit: card.Suit, Value: card.Value},
 		Payload: map[string]interface{}{
 			"source": "discardpile",
@@ -519,64 +512,69 @@ func (g *CambiaGame) drawTopDiscard(playerID uuid.UUID) *models.Card {
 	return card
 }
 
-// scheduleNextTurnTimer restarts a turn timer for the current player if turnDuration > 0.
-// Assumes lock is held.
+// scheduleNextTurnTimer sets or resets the timer for the current player's turn.
+// Handles disabled timers, disconnected players, and stale timer callbacks.
+// Assumes lock is held by caller.
 func (g *CambiaGame) scheduleNextTurnTimer() {
-	if g.TurnDuration <= 0 { // Skip if timer is disabled
+	// Stop any existing timer.
+	if g.turnTimer != nil {
+		g.turnTimer.Stop()
+		g.turnTimer = nil
+	}
+	// Skip if timer is disabled by rules or game is over/not started.
+	if g.TurnDuration <= 0 || g.GameOver || !g.Started {
 		return
 	}
-	if g.turnTimer != nil {
-		g.turnTimer.Stop() // Stop any existing timer
-	}
-	// Ensure there are players and index is valid before scheduling
+	// Validate player state.
 	if len(g.Players) == 0 || g.CurrentPlayerIndex < 0 || g.CurrentPlayerIndex >= len(g.Players) {
-		log.Printf("Game %s: Invalid player state (Players: %d, Index: %d), cannot schedule turn timer.", g.ID, len(g.Players), g.CurrentPlayerIndex)
-		// Optionally end game if state is unrecoverable
+		log.Printf("Game %s: Invalid player state (Players: %d, Index: %d). Cannot schedule turn timer.", g.ID, len(g.Players), g.CurrentPlayerIndex)
 		if !g.GameOver {
-			g.EndGame()
+			g.EndGame() // End game if state is unrecoverable.
 		}
 		return
 	}
-	// Get current player safely
+
 	currentPlayer := g.Players[g.CurrentPlayerIndex]
+	// Skip timer for disconnected players; advance turn immediately instead.
 	if !currentPlayer.Connected {
-		log.Printf("Game %s: Current player %s is disconnected. Skipping turn timer schedule.", g.ID, currentPlayer.ID)
-		g.advanceTurn() // Immediately advance if current player is disconnected
+		log.Printf("Game %s: Current player %s is disconnected. Advancing turn instead of starting timer.", g.ID, currentPlayer.ID)
+		g.advanceTurn() // Automatically skip disconnected player's turn.
 		return
 	}
 
 	curPID := currentPlayer.ID
+	currentTurnID := g.TurnID // Capture current turn ID for validation in callback.
 
+	// Schedule the timer callback.
 	g.turnTimer = time.AfterFunc(g.TurnDuration, func() {
-		// Run timeout logic in a separate goroutine to avoid deadlocking the timer callback
-		// if handleTimeout needs to acquire the same lock.
-		go func(playerID uuid.UUID, gameID uuid.UUID, turnID int) {
-			// Re-fetch game or pass necessary state if using a central store
-			// For in-memory, we need to re-acquire the lock
-			g.Mu.Lock()
+		// Execute timeout logic in a separate goroutine to avoid deadlocks.
+		go func(playerID uuid.UUID, gameID uuid.UUID, expectedTurnID int) {
+			g.Mu.Lock() // Re-acquire lock within the goroutine.
 			defer g.Mu.Unlock()
 
-			// Verify it's still this player's turn, game hasn't ended, and turn ID matches
-			// This prevents acting on a stale timer callback
-			if !g.GameOver && g.Started && len(g.Players) > g.CurrentPlayerIndex && g.Players[g.CurrentPlayerIndex].ID == playerID && g.TurnID == turnID {
+			// Validate if the timer is still relevant.
+			isValidTimer := !g.GameOver && g.Started &&
+				len(g.Players) > g.CurrentPlayerIndex &&
+				g.Players[g.CurrentPlayerIndex].ID == playerID && // Still this player's turn?
+				g.TurnID == expectedTurnID // Still the same turn number?
+
+			if isValidTimer {
 				log.Printf("Game %s, Turn %d: Timer fired for player %s.", g.ID, g.TurnID, playerID)
-				g.handleTimeout(playerID)
+				g.handleTimeout(playerID) // Handle the timeout logic.
 			} else {
-				log.Printf("Game %s, Turn %d: Stale timer fired for player %s (Current: %d, Game Over: %v, Started: %v). Ignoring.", g.ID, turnID, playerID, g.TurnID, g.GameOver, g.Started)
+				log.Printf("Game %s: Stale timer fired for player %s (Turn: %d, Expected: %d, CurrentPlayer: %s). Ignoring.", g.ID, playerID, g.TurnID, expectedTurnID, g.Players[g.CurrentPlayerIndex].ID)
 			}
-		}(curPID, g.ID, g.TurnID) // Pass game ID and current TurnID for validation
+		}(curPID, g.ID, currentTurnID) // Pass necessary identifiers for validation.
 	})
-	// log.Printf("Game %s: Scheduled turn timer for player %s (%s duration).", g.ID, curPID, g.TurnDuration)
+	// log.Printf("Game %s: Scheduled %s turn timer for player %s (Turn %d).", g.ID, g.TurnDuration, curPID, currentTurnID)
 }
 
-// handleTimeout forcibly handles player timeout.
-// If player has drawn a card, discard it.
-// If player is in a special action, skip it.
-// Otherwise, draw a card and immediately discard it.
-// Assumes lock is held.
+// handleTimeout processes the timeout logic for a player.
+// Discards drawn card, skips special actions, or draws/discards if necessary.
+// Assumes lock is held by caller.
 func (g *CambiaGame) handleTimeout(playerID uuid.UUID) {
-	log.Printf("Game %s: Player %s timed out.", g.ID, playerID)
-	g.logAction(playerID, "player_timeout", nil)
+	log.Printf("Game %s: Player %s timed out on turn %d.", g.ID, playerID, g.TurnID)
+	g.logAction(playerID, "player_timeout", map[string]interface{}{"turn": g.TurnID})
 
 	player := g.getPlayerByID(playerID)
 	if player == nil {
@@ -585,60 +583,53 @@ func (g *CambiaGame) handleTimeout(playerID uuid.UUID) {
 		return
 	}
 
-	// If a special action is active for this player, skip it.
+	// If a special action is pending, skip it.
 	if g.SpecialAction.Active && g.SpecialAction.PlayerID == playerID {
 		specialRank := g.SpecialAction.CardRank
 		log.Printf("Game %s: Timeout skipping special action for rank %s for player %s", g.ID, specialRank, playerID)
-
-		// Process the skip action directly
-		// Need to temporarily release lock if ProcessSpecialAction acquires it internally,
-		// but ProcessSpecialAction assumes lock is already held.
-		g.processSkipSpecialAction(playerID) // Call internal skip handler
-		// Turn is advanced within processSkipSpecialAction
-		return // Exit after handling special action skip
+		g.processSkipSpecialAction(playerID) // This advances the turn internally.
+		return
 	}
 
-	// Check if the player has a drawn card waiting for action
+	// If player had already drawn a card, discard it.
 	cardToDiscard := player.DrawnCard
 	if cardToDiscard != nil {
-		player.DrawnCard = nil // Clear the drawn card
+		player.DrawnCard = nil // Clear the held card.
 		log.Printf("Game %s: Player %s timed out with drawn card %s. Discarding.", g.ID, playerID, cardToDiscard.ID)
 	} else {
-		// If no card was drawn yet, draw one from the stockpile and prepare to discard it.
+		// Player timed out without drawing; draw and discard immediately.
 		log.Printf("Game %s: Player %s timed out without drawing. Drawing and discarding.", g.ID, playerID)
-		cardToDiscard = g.drawTopStockpile(playerID) // Draws and broadcasts public/private draw events
+		cardToDiscard = g.drawTopStockpile(playerID)
 		if cardToDiscard == nil {
-			log.Printf("Game %s: Player %s timed out, but no cards left to draw. Advancing turn.", g.ID, playerID)
-			g.advanceTurn() // No card to discard, just advance
+			log.Printf("Game %s: Player %s timed out, but no cards left to draw/discard. Advancing turn.", g.ID, playerID)
+			g.advanceTurn() // Game might end here via draw logic.
 			return
 		}
 	}
 
-	// Discard the card (either the one they held or the one just drawn)
+	// Discard the relevant card.
 	g.DiscardPile = append(g.DiscardPile, cardToDiscard)
 	g.logAction(playerID, "player_timeout_discard", map[string]interface{}{"cardId": cardToDiscard.ID})
-	// Broadcast the discard event
 	g.fireEvent(GameEvent{
 		Type: EventPlayerDiscard,
 		User: &EventUser{ID: playerID},
 		Card: &EventCard{ID: cardToDiscard.ID, Rank: cardToDiscard.Rank, Suit: cardToDiscard.Suit, Value: cardToDiscard.Value},
 	})
-	g.snapUsedForThisDiscard = false // Reset snap state
-	// Do NOT trigger special abilities on timeout discard
+	g.snapUsedForThisDiscard = false // Reset snap state.
+	// Do NOT trigger special abilities on timeout discard.
 
-	// Advance the turn after handling the timeout discard
-	g.advanceTurn()
+	g.advanceTurn() // Advance turn after handling the timeout.
 }
 
-// broadcastPlayerTurn notifies all players whose turn it is now.
-// Assumes lock is held.
+// broadcastPlayerTurn notifies all players of the current player's turn.
+// Assumes lock is held by caller.
 func (g *CambiaGame) broadcastPlayerTurn() {
+	// Validate state before broadcasting.
 	if g.GameOver || !g.Started || len(g.Players) == 0 || g.CurrentPlayerIndex < 0 || g.CurrentPlayerIndex >= len(g.Players) {
-		log.Printf("Cannot broadcast player turn in current state (GameOver:%v, Started:%v, Players:%d, Index:%d) for game %s", g.GameOver, g.Started, len(g.Players), g.CurrentPlayerIndex, g.ID)
+		log.Printf("Game %s: Cannot broadcast player turn in current state (GameOver:%v, Started:%v, Players:%d, Index:%d).", g.ID, g.GameOver, g.Started, len(g.Players), g.CurrentPlayerIndex)
 		return
 	}
 	currentPID := g.Players[g.CurrentPlayerIndex].ID
-	// Turn ID is incremented *before* scheduling the timer for that turn
 	log.Printf("Game %s: Turn %d starting for player %s.", g.ID, g.TurnID, currentPID)
 	g.fireEvent(GameEvent{
 		Type: EventGamePlayerTurn,
@@ -650,50 +641,51 @@ func (g *CambiaGame) broadcastPlayerTurn() {
 	g.logAction(currentPID, string(EventGamePlayerTurn), map[string]interface{}{"turn": g.TurnID})
 }
 
-// fireEvent broadcasts an event to all connected players.
-// Assumes lock is held.
+// fireEvent broadcasts an event to all connected players via the BroadcastFn callback.
+// Assumes lock is held by caller.
 func (g *CambiaGame) fireEvent(ev GameEvent) {
 	if g.BroadcastFn != nil {
-		g.BroadcastFn(ev)
+		g.BroadcastFn(ev) // Execute the callback.
 	} else {
-		log.Printf("Warning: BroadcastFn is nil for game %s, cannot broadcast event type %s.", g.ID, ev.Type)
+		log.Printf("Warning: Game %s: BroadcastFn is nil, cannot broadcast event type %s.", g.ID, ev.Type)
 	}
 }
 
-// fireEventToPlayer sends an event only to a specific player.
-// Assumes lock is held.
+// fireEventToPlayer sends an event to a specific player via the BroadcastToPlayerFn callback.
+// Checks if the player is connected before sending.
+// Assumes lock is held by caller.
 func (g *CambiaGame) fireEventToPlayer(playerID uuid.UUID, ev GameEvent) {
 	if g.BroadcastToPlayerFn != nil {
-		// Check if the target player is actually connected
 		targetPlayer := g.getPlayerByID(playerID)
 		if targetPlayer != nil && targetPlayer.Connected {
-			g.BroadcastToPlayerFn(playerID, ev)
+			g.BroadcastToPlayerFn(playerID, ev) // Execute the callback.
 		} else {
-			// log.Printf("Warning: Target player %s not found or not connected for private event type %s in game %s.", playerID, ev.Type, g.ID)
+			// Log quietly if player not found or disconnected.
+			// log.Printf("Debug: Game %s: Target player %s not found or not connected for private event type %s.", g.ID, playerID, ev.Type)
 		}
 	} else {
-		log.Printf("Warning: BroadcastToPlayerFn is nil for game %s, cannot send private event type %s to player %s.", g.ID, ev.Type, playerID)
+		log.Printf("Warning: Game %s: BroadcastToPlayerFn is nil, cannot send private event type %s to player %s.", g.ID, ev.Type, playerID)
 	}
 }
 
-// advanceTurn moves to the next valid player, handles Cambia final round logic, and game end.
-// Assumes lock is held.
+// advanceTurn moves game control to the next valid (connected) player.
+// Handles turn wrapping, skipping disconnected players, and Cambia end-game condition.
+// Assumes lock is held by caller.
 func (g *CambiaGame) advanceTurn() {
 	if g.GameOver {
 		return
 	}
 	if len(g.Players) == 0 {
-		log.Printf("Game %s: Cannot advance turn, no players in game.", g.ID)
+		log.Printf("Game %s: Cannot advance turn, no players remaining.", g.ID)
 		if !g.GameOver {
-			g.EndGame() // End game if no players left
+			g.EndGame()
 		}
 		return
 	}
 
-	// Calculate the index of the player whose turn just ended
-	prevPlayerIndex := g.CurrentPlayerIndex // Index before advancing
+	prevPlayerIndex := g.CurrentPlayerIndex
 
-	// If Cambia is called, check if the game should end
+	// Check Cambia end condition: If the turn just completed by the player *before* the caller.
 	if g.CambiaCalled {
 		callerIdx := -1
 		for i, p := range g.Players {
@@ -702,33 +694,28 @@ func (g *CambiaGame) advanceTurn() {
 				break
 			}
 		}
-
-		// If the player whose turn just ended (prevPlayerIndex) is the one *before* the caller,
-		// the final round is over. The modulo arithmetic handles wrap-around.
+		// Use modulo arithmetic for wrap-around check.
 		if callerIdx != -1 && prevPlayerIndex == (callerIdx-1+len(g.Players))%len(g.Players) {
 			log.Printf("Game %s: Final turn after Cambia call completed by player %s. Ending game.", g.ID, g.Players[prevPlayerIndex].ID)
 			if !g.GameOver {
-				g.EndGame() // End the game immediately
+				g.EndGame()
 			}
-			return // Stop processing turn advancement
+			return // Stop advancement, game is ending.
 		}
 	}
 
-	// Increment Turn ID *before* scheduling the next turn
+	// Increment Turn ID for the *next* turn.
 	g.TurnID++
 
-	// Move to the next player index
+	// Find the next connected player.
 	nextIndex := (prevPlayerIndex + 1) % len(g.Players)
-
-	// Skip disconnected players if needed (or handle differently based on rules)
-	// REMOVED unused startIndex
-	skippedCount := 0 // Track skips to prevent infinite loop
+	skippedCount := 0
 	for !g.Players[nextIndex].Connected {
 		log.Printf("Game %s: Skipping disconnected player %s at index %d.", g.ID, g.Players[nextIndex].ID, nextIndex)
 		nextIndex = (nextIndex + 1) % len(g.Players)
 		skippedCount++
-		if skippedCount >= len(g.Players) { // Use skippedCount instead of comparing index
-			log.Printf("Game %s: No connected players left to advance turn to after checking all. Ending game.", g.ID)
+		if skippedCount >= len(g.Players) {
+			log.Printf("Game %s: No connected players left. Ending game.", g.ID)
 			if !g.GameOver {
 				g.EndGame()
 			}
@@ -738,165 +725,159 @@ func (g *CambiaGame) advanceTurn() {
 
 	g.CurrentPlayerIndex = nextIndex
 
-	// Reset player's drawn card state for the new turn
-	if len(g.Players) > g.CurrentPlayerIndex && g.Players[g.CurrentPlayerIndex] != nil {
-		g.Players[g.CurrentPlayerIndex].DrawnCard = nil
+	// Reset the new current player's state.
+	if g.Players[g.CurrentPlayerIndex] != nil {
+		g.Players[g.CurrentPlayerIndex].DrawnCard = nil // Clear any previously drawn card.
 	} else {
-		log.Printf("Error: CurrentPlayerIndex %d out of bounds or player is nil during turn advance.", g.CurrentPlayerIndex)
-		// Potentially end game or handle error state
+		log.Printf("Error: Game %s: Current player at index %d is nil during turn advance.", g.ID, g.CurrentPlayerIndex)
 		if !g.GameOver {
 			g.EndGame()
 		}
 		return
 	}
 
-	// Stop previous timer and schedule next
-	if g.turnTimer != nil {
-		g.turnTimer.Stop()
-	}
-	g.scheduleNextTurnTimer() // This now uses the incremented TurnID
+	// Schedule the timer for the new turn.
+	g.scheduleNextTurnTimer() // This uses the incremented TurnID.
 
-	// Broadcast whose turn it is now
+	// Broadcast the new turn event.
 	g.broadcastPlayerTurn()
 }
 
-// HandleDisconnect processes a player’s disconnection.
+// HandleDisconnect marks a player as disconnected and handles game state consequences.
+// Assumes lock is held by caller.
 func (g *CambiaGame) HandleDisconnect(playerID uuid.UUID) {
-	g.Mu.Lock()
-	defer g.Mu.Unlock()
 	log.Printf("Game %s: Handling disconnect for player %s.", g.ID, playerID)
 	g.logAction(playerID, "player_disconnect", nil)
-	found := false
+
 	playerIndex := -1
+	found := false
 	for i := range g.Players {
 		if g.Players[i].ID == playerID {
 			if !g.Players[i].Connected {
 				log.Printf("Game %s: Player %s already marked as disconnected.", g.ID, playerID)
-				return // Avoid processing disconnect twice
+				return // Already handled.
 			}
 			g.Players[i].Connected = false
-			g.Players[i].Conn = nil // Clear connection object
+			g.Players[i].Conn = nil // Clear WebSocket connection reference.
 			found = true
 			playerIndex = i
 			break
 		}
 	}
 	if !found {
-		log.Printf("Game %s: Disconnected player %s not found in game.", g.ID, playerID)
+		log.Printf("Game %s: Disconnected player %s not found.", g.ID, playerID)
 		return
 	}
 
-	// Check if game should end or turn should advance
-	shouldAdvance := false
+	shouldAdvanceTurn := false
+	shouldEndGame := false
+
 	if g.Started && !g.GameOver {
-		// Option 1: Forfeit immediately if rule enabled and check if game should end
+		// Check if game ends due to forfeit rule.
 		if g.HouseRules.ForfeitOnDisconnect {
-			log.Printf("Game %s: Player %s disconnected, marked as forfeited due to house rules.", g.ID, playerID)
-			// Check if only one player remains (or zero)
+			log.Printf("Game %s: Player %s disconnected, forfeiting due to house rules.", g.ID, playerID)
 			if g.countConnectedPlayers() <= 1 {
-				log.Printf("Game %s: Only one or zero players left connected after forfeit. Ending game.", g.ID)
-				if !g.GameOver {
-					g.EndGame() // End game immediately
-				}
-				return // Don't advance turn if game ended
+				log.Printf("Game %s: Only %d player(s) left connected after forfeit. Ending game.", g.ID, g.countConnectedPlayers())
+				shouldEndGame = true
 			}
-		}
-		// Check if the disconnected player was the current player
-		if playerIndex == g.CurrentPlayerIndex {
-			log.Printf("Game %s: Current player %s disconnected. Advancing turn.", g.ID, playerID)
-			shouldAdvance = true // Advance turn if the current player disconnected
+		} else {
+			// If no forfeit, check if the current player disconnected.
+			if playerIndex == g.CurrentPlayerIndex {
+				log.Printf("Game %s: Current player %s disconnected. Advancing turn.", g.ID, playerID)
+				shouldAdvanceTurn = true
+			}
 		}
 	}
 
-	// Broadcast the disconnected state *before* advancing turn
+	// Broadcast updated state to remaining players *before* ending or advancing.
 	g.broadcastSyncStateToAll()
 
-	// Advance turn if needed (e.g., current player left)
-	if shouldAdvance {
-		// Call advanceTurn internally without unlocking/relocking
-		g.advanceTurn()
+	if shouldEndGame {
+		if !g.GameOver {
+			g.EndGame() // End the game immediately.
+		}
+	} else if shouldAdvanceTurn {
+		g.advanceTurn() // Advance turn if current player left.
 	}
 }
 
-// handleReconnect marks a player as connected again.
+// HandleReconnect marks a player as connected and sends them the current game state.
+// Assumes lock is held by caller.
 func (g *CambiaGame) HandleReconnect(playerID uuid.UUID, conn *websocket.Conn) {
-	g.Mu.Lock()
-	defer g.Mu.Unlock()
 	log.Printf("Game %s: Handling reconnect for player %s.", g.ID, playerID)
-	g.logAction(playerID, "player_reconnect", nil)
+
 	found := false
 	for i := range g.Players {
 		if g.Players[i].ID == playerID {
 			if g.Players[i].Connected {
-				log.Printf("Game %s: Player %s attempting to reconnect but already marked as connected.", g.ID, playerID)
-				// Update connection anyway, maybe the old one died silently
+				log.Printf("Game %s: Player %s reconnected but was already marked connected.", g.ID, playerID)
+				// Update connection object anyway.
 			}
 			g.Players[i].Connected = true
-			g.Players[i].Conn = conn // Update connection object
+			g.Players[i].Conn = conn
+			g.Players[i].User = g.Players[i].User // Assume User struct is still valid.
 			g.lastSeen[playerID] = time.Now()
 			found = true
-			// Send current game state upon reconnect
+
+			g.logAction(playerID, "player_reconnect", map[string]interface{}{"username": g.Players[i].User.Username})
+
+			// Send sync state immediately to the reconnected player.
 			g.sendSyncState(playerID)
+
+			// Broadcast updated state to others.
+			g.broadcastSyncStateToAll()
+
+			// If it was this player's turn, reschedule timer.
+			if g.Started && !g.GameOver && g.CurrentPlayerIndex == i {
+				log.Printf("Game %s: Player %s reconnected on their turn. Rescheduling timer.", g.ID, playerID)
+				g.scheduleNextTurnTimer()
+			}
 			break
 		}
 	}
+
 	if !found {
 		log.Printf("Game %s: Reconnecting player %s not found in game.", g.ID, playerID)
-		// Optionally add them back if game rules allow late joins/rejoins after full removal
-		// If adding back, need to deal cards, etc. Complex logic.
-		// For now, just log. Close the connection?
+		g.logAction(playerID, "player_reconnect_fail", map[string]interface{}{"reason": "player not found"})
 		if conn != nil {
+			// Close connection if player isn't actually part of this game.
 			conn.Close(websocket.StatusPolicyViolation, "Game not found or you were removed.")
-		}
-	} else {
-		// Broadcast sync state to everyone else too so they see the player reconnect
-		g.broadcastSyncStateToAll()
-
-		// If it's this player's turn and they were disconnected, restart timer?
-		if g.Started && !g.GameOver && g.CurrentPlayerIndex >= 0 && g.CurrentPlayerIndex < len(g.Players) && g.Players[g.CurrentPlayerIndex].ID == playerID {
-			log.Printf("Game %s: Reconnected player %s's turn. Restarting turn timer.", g.ID, playerID)
-			g.scheduleNextTurnTimer() // Reschedule timer for the reconnected player
 		}
 	}
 }
 
-// sendSyncState sends the obfuscated game state to a specific player.
+// sendSyncState sends the current obfuscated game state to a single player.
 // Assumes lock is held by caller.
 func (g *CambiaGame) sendSyncState(playerID uuid.UUID) {
 	if g.BroadcastToPlayerFn == nil {
 		log.Println("Warning: BroadcastToPlayerFn is nil, cannot send sync state.")
 		return
 	}
-	// Generate state specifically for this player
-	state := g.GetCurrentObfuscatedGameState(playerID) // Call the method
+	// Generate state specifically for this player.
+	state := g.GetCurrentObfuscatedGameState(playerID)
 	ev := GameEvent{
 		Type:  EventPrivateSyncState,
-		State: &state, // Embed the state object directly
+		State: &state, // Embed the state object.
 	}
-	g.fireEventToPlayer(playerID, ev)
-	// log.Printf("Game %s: Sent sync state to player %s.", g.ID, playerID) // Reduce log noise
+	g.fireEventToPlayer(playerID, ev) // Uses internal check for connection status.
+	// log.Printf("Game %s: Sent sync state to player %s.", g.ID, playerID) // Reduce noise.
 }
 
-// broadcastSyncStateToAll sends the sync state to all currently connected players.
+// broadcastSyncStateToAll sends the obfuscated game state to all currently connected players.
 // Assumes lock is held by caller.
 func (g *CambiaGame) broadcastSyncStateToAll() {
 	if g.BroadcastToPlayerFn == nil {
 		log.Println("Warning: BroadcastToPlayerFn is nil, cannot broadcast sync state to all.")
 		return
 	}
-	playerIDs := []uuid.UUID{}
+	connectedCount := 0
 	for _, p := range g.Players {
 		if p.Connected {
-			playerIDs = append(playerIDs, p.ID)
+			g.sendSyncState(p.ID) // Generate and send state for each connected player.
+			connectedCount++
 		}
 	}
-
-	// Send state outside the player loop if generation is safe
-	for _, playerID := range playerIDs {
-		// Need to generate state specifically for each player
-		g.sendSyncState(playerID)
-	}
-	log.Printf("Game %s: Broadcasted sync state to %d connected players.", g.ID, len(playerIDs))
+	// log.Printf("Game %s: Broadcasted sync state to %d connected players.", g.ID, connectedCount) // Reduce noise.
 }
 
 // countConnectedPlayers returns the number of players currently marked as connected.
@@ -911,7 +892,7 @@ func (g *CambiaGame) countConnectedPlayers() int {
 	return count
 }
 
-// drawCardFromLocation handles drawing from stockpile or discard, wrapper for events.
+// drawCardFromLocation wraps draw logic for stockpile or discard pile.
 // Assumes lock is held by caller.
 func (g *CambiaGame) drawCardFromLocation(playerID uuid.UUID, location string) *models.Card {
 	var card *models.Card
@@ -922,74 +903,76 @@ func (g *CambiaGame) drawCardFromLocation(playerID uuid.UUID, location string) *
 	} else {
 		log.Printf("Game %s: Invalid draw location '%s' requested by player %s.", g.ID, location, playerID)
 		g.fireEventToPlayer(playerID, GameEvent{Type: EventPrivateSpecialFail, Payload: map[string]interface{}{"message": "Invalid draw location specified."}})
-		return nil
+		return nil // Invalid location.
 	}
-	return card
+	return card // Returns card or nil if draw failed.
 }
 
-// HandlePlayerAction interprets draw, discard, snap, cambia, replace, etc.
-// This is the main router for player actions during their turn (or snap out of turn).
-// Assumes lock is held by the caller (e.g., the WS handler).
+// HandlePlayerAction routes incoming player actions (draw, discard, replace, snap, cambia).
+// Validates turn, state, and payload before executing the corresponding handler.
+// Assumes lock is held by the caller.
 func (g *CambiaGame) HandlePlayerAction(playerID uuid.UUID, action models.GameAction) {
-	// NOTE: Lock is assumed to be HELD by the caller.
-
+	// --- Basic State Checks ---
 	if g.GameOver {
-		log.Printf("Game %s: Action %s received from player %s after game over. Ignoring.", g.ID, action.ActionType, playerID)
+		log.Printf("Game %s: Action %s from %s ignored (game over).", g.ID, action.ActionType, playerID)
 		return
 	}
 	if !g.Started && !g.PreGameActive {
-		log.Printf("Game %s: Action %s received from player %s before game start. Ignoring.", g.ID, action.ActionType, playerID)
+		log.Printf("Game %s: Action %s from %s ignored (game not started).", g.ID, action.ActionType, playerID)
 		return
 	}
-	if g.PreGameActive { // No actions allowed during pregame reveal
-		log.Printf("Game %s: Action %s received from player %s during pregame. Ignoring.", g.ID, action.ActionType, playerID)
+	if g.PreGameActive {
+		log.Printf("Game %s: Action %s from %s ignored (pre-game active).", g.ID, action.ActionType, playerID)
 		g.fireEventToPlayer(playerID, GameEvent{Type: EventPrivateSpecialFail, Payload: map[string]interface{}{"message": "Cannot perform actions during pre-game reveal."}})
 		return
 	}
 
-	// Check if player exists and is connected
+	// --- Player Validation ---
 	player := g.getPlayerByID(playerID)
 	if player == nil || !player.Connected {
-		log.Printf("Game %s: Action %s received from non-existent or disconnected player %s. Ignoring.", g.ID, action.ActionType, playerID)
+		log.Printf("Game %s: Action %s from non-existent/disconnected player %s ignored.", g.ID, action.ActionType, playerID)
 		return
 	}
 
-	// Check if it's the player's turn, except for snap action
+	// --- Turn and State Validation ---
 	isCurrentPlayer := len(g.Players) > g.CurrentPlayerIndex && g.Players[g.CurrentPlayerIndex].ID == playerID
+	// Allow snap anytime.
 	if action.ActionType != "action_snap" && !isCurrentPlayer {
-		log.Printf("Game %s: Action %s received from player %s out of turn. Ignoring.", g.ID, action.ActionType, playerID)
+		log.Printf("Game %s: Action %s from %s ignored (not their turn).", g.ID, action.ActionType, playerID)
 		g.fireEventToPlayer(playerID, GameEvent{Type: EventPrivateSpecialFail, Payload: map[string]interface{}{"message": "It's not your turn."}})
 		return
 	}
-	// Check if player is trying to act while a special action is pending for them
+	// Check if blocked by pending special action.
 	if g.SpecialAction.Active && g.SpecialAction.PlayerID == playerID && action.ActionType != "action_special" {
-		log.Printf("Game %s: Player %s attempted action %s while special action for rank %s is pending. Ignoring.", g.ID, playerID, action.ActionType, g.SpecialAction.CardRank)
+		log.Printf("Game %s: Action %s from %s ignored (special action pending).", g.ID, action.ActionType, playerID)
 		g.fireEventToPlayer(playerID, GameEvent{Type: EventPrivateSpecialFail, Payload: map[string]interface{}{"message": "You must resolve the special card action first (use action_special with 'skip' or required payload)."}})
 		return
 	}
-	// Check if player already drew a card and is trying to draw again
-	if player.DrawnCard != nil && (action.ActionType == "action_draw_stockpile" || action.ActionType == "action_draw_discardpile") {
-		log.Printf("Game %s: Player %s tried to draw again after already drawing. Ignoring.", g.ID, playerID)
+	// Prevent drawing twice.
+	isDrawAction := action.ActionType == "action_draw_stockpile" || action.ActionType == "action_draw_discardpile"
+	if player.DrawnCard != nil && isDrawAction {
+		log.Printf("Game %s: Action %s from %s ignored (already drawn).", g.ID, action.ActionType, playerID)
 		g.fireEventToPlayer(playerID, GameEvent{Type: EventPrivateSpecialFail, Payload: map[string]interface{}{"message": "You have already drawn a card this turn."}})
 		return
 	}
-	// Check if player hasn't drawn and is trying to discard/replace
-	if player.DrawnCard == nil && (action.ActionType == "action_discard" || action.ActionType == "action_replace") {
-		log.Printf("Game %s: Player %s tried to %s without drawing first. Ignoring.", g.ID, playerID, action.ActionType)
+	// Prevent discard/replace without drawing first.
+	isDiscardReplace := action.ActionType == "action_discard" || action.ActionType == "action_replace"
+	if player.DrawnCard == nil && isDiscardReplace {
+		log.Printf("Game %s: Action %s from %s ignored (must draw first).", g.ID, action.ActionType, playerID)
 		g.fireEventToPlayer(playerID, GameEvent{Type: EventPrivateSpecialFail, Payload: map[string]interface{}{"message": "You must draw a card first."}})
 		return
 	}
 
-	// Update last seen time for the active player
+	// Update last seen time.
 	g.lastSeen[playerID] = time.Now()
 
-	// Route the action
+	// --- Route Action ---
 	switch action.ActionType {
 	case "action_snap":
-		g.handleSnap(playerID, action.Payload) // Snap can happen anytime
+		g.handleSnap(playerID, action.Payload)
 	case "action_draw_stockpile":
 		g.handleDrawFrom(playerID, "stockpile")
-	case "action_draw_discardpile": // Corrected type name
+	case "action_draw_discardpile":
 		g.handleDrawFrom(playerID, "discardpile")
 	case "action_discard":
 		g.handleDiscard(playerID, action.Payload)
@@ -997,114 +980,77 @@ func (g *CambiaGame) HandlePlayerAction(playerID uuid.UUID, action models.GameAc
 		g.handleReplace(playerID, action.Payload)
 	case "action_cambia":
 		g.handleCallCambia(playerID)
-	// action_special is handled by ProcessSpecialAction, called from WS handler
+	// Note: "action_special" is handled directly by ProcessSpecialAction.
 	default:
 		log.Printf("Game %s: Unknown action type '%s' received from player %s.", g.ID, action.ActionType, playerID)
 		g.fireEventToPlayer(playerID, GameEvent{Type: EventPrivateSpecialFail, Payload: map[string]interface{}{"message": "Unknown action type."}})
 	}
 }
 
-// handleDrawFrom handles drawing from either stockpile or discard pile.
-// Assumes lock is held by caller.
+// handleDrawFrom processes drawing from the specified location (stockpile or discard).
+// Assumes lock is held by caller and basic validation passed.
 func (g *CambiaGame) handleDrawFrom(playerID uuid.UUID, location string) {
-	player := g.getPlayerByID(playerID)
-	if player == nil {
-		log.Printf("Game %s: Player %s not found for draw action.", g.ID, playerID)
-		return // Should not happen if checks passed
-	}
-	// Redundant check, already done in HandlePlayerAction
-	// if player.DrawnCard != nil { ... }
+	player := g.getPlayerByID(playerID) // Assumed to exist.
+	card := g.drawCardFromLocation(playerID, location)
 
-	card := g.drawCardFromLocation(playerID, location) // This handles broadcasts internally
 	if card != nil {
-		player.DrawnCard = card // Store the drawn card temporarily
-		g.ResetTurnTimer()      // Reset timer after successful draw
+		player.DrawnCard = card // Store the drawn card.
+		g.ResetTurnTimer()      // Reset timer after successful draw.
 	} else {
-		// Draw failed (e.g., empty piles), turn should likely advance or game end
-		log.Printf("Game %s: Draw from %s failed for player %s. Advancing turn.", g.ID, location, playerID)
-		// internalDrawStockpile might end the game if both piles are empty
-		if !g.GameOver {
-			g.advanceTurn()
-		}
+		// Draw failed (e.g., empty piles). Game may have ended in drawCardFromLocation.
+		log.Printf("Game %s: Draw from %s failed for player %s.", g.ID, location, playerID)
+		// No explicit turn advance needed here; draw logic handles game end or returns nil.
 	}
-	// No turn advance here if draw succeeded; player must now discard or replace.
+	// Turn does not advance here; player must now discard or replace.
 }
 
-// handleDiscard handles discarding the player's DrawnCard.
-// Assumes lock is held by caller.
+// handleDiscard processes discarding the currently held DrawnCard.
+// Assumes lock is held by caller and basic validation passed.
 func (g *CambiaGame) handleDiscard(playerID uuid.UUID, payload map[string]interface{}) {
-	player := g.getPlayerByID(playerID)
-	if player == nil {
-		log.Printf("Game %s: Player %s not found for discard action.", g.ID, playerID)
-		return
-	}
-	// Redundant check, already done in HandlePlayerAction
-	// if player.DrawnCard == nil { ... }
+	player := g.getPlayerByID(playerID) // Assumed to exist.
+	drawnCard := player.DrawnCard       // Assumed to be non-nil.
 
-	// Check if DrawnCard is nil before accessing its ID (important!)
-	if player.DrawnCard == nil {
-		log.Printf("Game %s: Player %s discard attempt failed, no card was drawn.", g.ID, playerID)
-		g.fireEventToPlayer(playerID, GameEvent{Type: EventPrivateSpecialFail, Payload: map[string]interface{}{"message": "No card drawn to discard."}})
-		return
-	}
-
-	// Verify the card ID in the payload matches the drawn card
-	cardIDStr, _ := payload["id"].(string) // Use Card.ID from payload
+	// Validate card ID from payload matches the held card.
+	cardIDStr, _ := payload["id"].(string)
 	cardID, err := uuid.Parse(cardIDStr)
-
-	if err != nil || player.DrawnCard.ID != cardID {
-		log.Printf("Game %s: Player %s discard payload card ID '%s' does not match drawn card ID '%s'. Ignoring.", g.ID, playerID, cardIDStr, player.DrawnCard.ID)
+	if err != nil || drawnCard.ID != cardID {
+		log.Printf("Game %s: Player %s discard payload card ID '%s' does not match drawn card ID '%s'. Ignoring.", g.ID, playerID, cardIDStr, drawnCard.ID)
 		g.fireEventToPlayer(playerID, GameEvent{Type: EventPrivateSpecialFail, Payload: map[string]interface{}{"message": "Card ID mismatch for discard."}})
 		return
 	}
 
-	discardedCard := player.DrawnCard
-	player.DrawnCard = nil // Clear the drawn card from player state
+	player.DrawnCard = nil // Clear the held card.
 
-	g.DiscardPile = append(g.DiscardPile, discardedCard)
-	g.logAction(playerID, string(EventPlayerDiscard), map[string]interface{}{"cardId": discardedCard.ID, "source": "drawn"})
+	g.DiscardPile = append(g.DiscardPile, drawnCard)
+	g.logAction(playerID, string(EventPlayerDiscard), map[string]interface{}{"cardId": drawnCard.ID, "source": "drawn"})
 
-	// Broadcast discard event with full card details
+	// Broadcast discard event (revealing card details).
 	g.fireEvent(GameEvent{
 		Type: EventPlayerDiscard,
 		User: &EventUser{ID: playerID},
-		Card: &EventCard{ID: discardedCard.ID, Rank: discardedCard.Rank, Suit: discardedCard.Suit, Value: discardedCard.Value},
-		// No Idx needed here as per spec for discarding a drawn card
+		Card: &EventCard{ID: drawnCard.ID, Rank: drawnCard.Rank, Suit: drawnCard.Suit, Value: drawnCard.Value},
 	})
 
-	g.snapUsedForThisDiscard = false // Reset snap state for the new discard
+	g.snapUsedForThisDiscard = false // Reset snap state.
 
-	// Check for special ability only on freshly drawn cards (standard rule)
-	// AllowReplaceAbilities rule applies only when replacing, not direct discard.
-	triggered := g.applySpecialAbilityIfFreshlyDrawn(discardedCard, playerID)
-	// If triggered, applySpecialAbility handles timer reset.
-	// If not triggered, applySpecialAbility advances the turn.
-	if !triggered {
-		// Turn already advanced in applySpecialAbilityIfFreshlyDrawn if no ability
-	} else {
-		// Timer reset in applySpecialAbilityIfFreshlyDrawn if ability triggered
-	}
+	// Check for special ability on the discarded card.
+	// This function handles advancing the turn if no ability is triggered,
+	// or resetting the timer if an ability requires further player input.
+	g.applySpecialAbilityIfFreshlyDrawn(drawnCard, playerID)
 }
 
-// handleReplace handles swapping the player's DrawnCard with a card at a specific index in their hand.
-// Assumes lock is held by caller.
+// handleReplace processes swapping the DrawnCard with a card in the player's hand.
+// Assumes lock is held by caller and basic validation passed.
 func (g *CambiaGame) handleReplace(playerID uuid.UUID, payload map[string]interface{}) {
-	player := g.getPlayerByID(playerID)
-	if player == nil {
-		log.Printf("Game %s: Player %s not found for replace action.", g.ID, playerID)
-		return
-	}
-	if player.DrawnCard == nil {
-		log.Printf("Game %s: Player %s replace attempt failed, no card was drawn.", g.ID, playerID)
-		g.fireEventToPlayer(playerID, GameEvent{Type: EventPrivateSpecialFail, Payload: map[string]interface{}{"message": "No card drawn to replace with."}})
-		return
-	}
+	player := g.getPlayerByID(playerID) // Assumed to exist.
+	drawnCard := player.DrawnCard       // Assumed to be non-nil.
 
-	// Card ID in payload should be the ID of the card *being replaced* in the hand.
-	cardIDToReplaceStr, _ := payload["id"].(string) // Use Card.ID from payload
+	// Extract target card ID and index from payload.
+	cardIDToReplaceStr, _ := payload["id"].(string)
 	idxToReplaceFloat, idxOK := payload["idx"].(float64)
 	idxToReplace := int(idxToReplaceFloat)
 
+	// Validate index.
 	if !idxOK || idxToReplace < 0 || idxToReplace >= len(player.Hand) {
 		log.Printf("Game %s: Player %s provided invalid index %d for replace action. Hand size: %d. Ignoring.", g.ID, playerID, idxToReplace, len(player.Hand))
 		g.fireEventToPlayer(playerID, GameEvent{Type: EventPrivateSpecialFail, Payload: map[string]interface{}{"message": "Invalid index for replacement."}})
@@ -1112,7 +1058,7 @@ func (g *CambiaGame) handleReplace(playerID uuid.UUID, payload map[string]interf
 	}
 
 	cardToReplace := player.Hand[idxToReplace]
-	// Optional: Verify the ID from payload matches the card at the index
+	// Validate target card ID matches the card at the index.
 	cardIDToReplace, err := uuid.Parse(cardIDToReplaceStr)
 	if err != nil || cardToReplace.ID != cardIDToReplace {
 		log.Printf("Game %s: Player %s replace payload card ID '%s' does not match card ID '%s' at index %d. Ignoring.", g.ID, playerID, cardIDToReplaceStr, cardToReplace.ID, idxToReplace)
@@ -1120,155 +1066,127 @@ func (g *CambiaGame) handleReplace(playerID uuid.UUID, payload map[string]interf
 		return
 	}
 
-	drawnCard := player.DrawnCard
-	player.DrawnCard = nil // Clear drawn card state
+	player.DrawnCard = nil // Clear held card state.
 
-	// Perform the swap in the player's hand
+	// Perform swap and discard.
 	player.Hand[idxToReplace] = drawnCard
-
-	// Add the replaced card to the discard pile
 	g.DiscardPile = append(g.DiscardPile, cardToReplace)
-	g.logAction(playerID, string(EventPlayerDiscard), map[string]interface{}{ // Log as a discard event
+	g.logAction(playerID, string(EventPlayerDiscard), map[string]interface{}{
 		"cardId":  cardToReplace.ID,
 		"index":   idxToReplace,
-		"source":  "replace", // Indicate source was replacement
+		"source":  "replace",
 		"drawnId": drawnCard.ID,
 	})
 
-	// Broadcast discard event for the card leaving the hand
-	eventIdx := idxToReplace // Capture index for pointer
+	// Broadcast discard event for the card leaving the hand.
+	eventIdx := idxToReplace
 	g.fireEvent(GameEvent{
 		Type: EventPlayerDiscard,
 		User: &EventUser{ID: playerID},
-		Card: &EventCard{ID: cardToReplace.ID, Rank: cardToReplace.Rank, Suit: cardToReplace.Suit, Value: cardToReplace.Value, Idx: &eventIdx}, // Include index here
+		Card: &EventCard{ID: cardToReplace.ID, Rank: cardToReplace.Rank, Suit: cardToReplace.Suit, Value: cardToReplace.Value, Idx: &eventIdx},
 	})
 
-	g.snapUsedForThisDiscard = false // Reset snap state
+	g.snapUsedForThisDiscard = false // Reset snap state.
 
-	// Check for special ability on the *replaced* card if the house rule allows it.
+	// Check special ability based on house rule.
 	abilityTriggered := false
 	if g.HouseRules.AllowReplaceAbilities {
 		abilityTriggered = g.applySpecialAbilityIfFreshlyDrawn(cardToReplace, playerID)
 	}
 
-	// If no special ability was triggered by the replaced card, advance the turn.
+	// Advance turn if no ability was triggered or requires further action.
 	if !abilityTriggered {
 		g.advanceTurn()
-	} else {
-		// Timer reset handled within applySpecialAbility
 	}
+	// Timer reset/handling occurs within applySpecialAbilityIfFreshlyDrawn if triggered.
 }
 
-// handleSnap processes an out-of-turn snap/burn attempt.
+// handleSnap processes an out-of-turn snap attempt by a player.
 // Assumes lock is held by caller.
 func (g *CambiaGame) handleSnap(playerID uuid.UUID, payload map[string]interface{}) {
-	cardIDStr, _ := payload["id"].(string) // Use Card.ID from payload
+	// Validate payload.
+	cardIDStr, _ := payload["id"].(string)
 	cardID, err := uuid.Parse(cardIDStr)
 	if err != nil {
 		log.Printf("Game %s: Invalid card ID '%s' in snap payload from player %s. Ignoring.", g.ID, cardIDStr, playerID)
 		g.fireEventToPlayer(playerID, GameEvent{Type: EventPrivateSpecialFail, Payload: map[string]interface{}{"message": "Invalid card ID format for snap."}})
 		return
 	}
-
 	g.logAction(playerID, "action_snap_attempt", map[string]interface{}{"cardId": cardID})
 
+	// Check discard pile state.
 	if len(g.DiscardPile) == 0 {
-		log.Printf("Game %s: Player %s attempted to snap card %s, but discard pile is empty. Penalizing.", g.ID, playerID, cardID)
-		g.penalizeSnapFail(playerID, nil) // Pass nil as card wasn't found/validated yet
+		log.Printf("Game %s: Player %s snap failed (discard empty). Penalizing.", g.ID, playerID)
+		g.penalizeSnapFail(playerID, nil) // Pass nil card ID.
 		return
 	}
 
-	// If SnapRace is true and a snap already succeeded for this discard, fail subsequent attempts.
+	// Check SnapRace rule.
 	if g.HouseRules.SnapRace && g.snapUsedForThisDiscard {
-		log.Printf("Game %s: Player %s snap attempt for card %s failed due to SnapRace rule.", g.ID, playerID, cardID)
-		g.penalizeSnapFail(playerID, nil) // Card wasn't validated, pass nil
+		log.Printf("Game %s: Player %s snap failed (SnapRace used). Penalizing.", g.ID, playerID)
+		g.penalizeSnapFail(playerID, nil) // Pass nil card ID.
 		return
 	}
 
 	lastDiscardedCard := g.DiscardPile[len(g.DiscardPile)-1]
-	player := g.getPlayerByID(playerID)
-	if player == nil {
-		log.Printf("Game %s: Player %s not found for snap action.", g.ID, playerID)
-		return // Should not happen if player is connected
-	}
+	player := g.getPlayerByID(playerID) // Assumed to exist.
 
-	// Find the card in the player's hand
-	var snappedCard *models.Card
-	var snappedCardIdx int = -1
-	for h, c := range player.Hand {
-		if c.ID == cardID {
-			snappedCard = c
-			snappedCardIdx = h
-			break
-		}
-	}
-
+	// Find card in player's hand.
+	snappedCard, snappedCardIdx := g.findCardByID(playerID, cardID)
 	if snappedCard == nil {
-		log.Printf("Game %s: Player %s attempted to snap card %s which was not found in their hand. Penalizing.", g.ID, playerID, cardID)
-		g.penalizeSnapFail(playerID, nil) // Card not found, pass nil
+		log.Printf("Game %s: Player %s snap failed (card %s not in hand). Penalizing.", g.ID, playerID, cardID)
+		g.penalizeSnapFail(playerID, nil) // Pass nil card ID.
 		return
 	}
 
-	// Check if ranks match
+	// Check for rank match.
 	if snappedCard.Rank == lastDiscardedCard.Rank {
-		// Successful Snap!
+		// --- Successful Snap ---
 		log.Printf("Game %s: Player %s successfully snapped card %s (Rank: %s).", g.ID, playerID, snappedCard.ID, snappedCard.Rank)
 		g.logAction(playerID, string(EventPlayerSnapSuccess), map[string]interface{}{"cardId": snappedCard.ID, "rank": snappedCard.Rank})
 
-		// Mark snap used if race rule applies
 		if g.HouseRules.SnapRace {
-			g.snapUsedForThisDiscard = true
+			g.snapUsedForThisDiscard = true // Mark snap used for this discard.
 		}
 
-		// Remove card from player's hand
-		player.Hand = append(player.Hand[:snappedCardIdx], player.Hand[snappedCardIdx+1:]...)
+		// Update game state.
+		player.Hand = append(player.Hand[:snappedCardIdx], player.Hand[snappedCardIdx+1:]...) // Remove card.
+		g.DiscardPile = append(g.DiscardPile, snappedCard)                                    // Add to discard.
 
-		// Add snapped card to discard pile
-		g.DiscardPile = append(g.DiscardPile, snappedCard)
-
-		// Broadcast success event
-		eventIdx := snappedCardIdx // Use the original index in hand for the event
+		// Broadcast success event.
+		eventIdx := snappedCardIdx
 		g.fireEvent(GameEvent{
 			Type: EventPlayerSnapSuccess,
 			User: &EventUser{ID: playerID},
-			Card: &EventCard{
-				ID:    snappedCard.ID,
-				Rank:  snappedCard.Rank,
-				Suit:  snappedCard.Suit,
-				Value: snappedCard.Value,
-				Idx:   &eventIdx, // Include index from where it was snapped
-			},
+			Card: &EventCard{ID: snappedCard.ID, Rank: snappedCard.Rank, Suit: snappedCard.Suit, Value: snappedCard.Value, Idx: &eventIdx},
 		})
-		// Consider if turn should change on successful snap (rules don't specify, usually doesn't)
+		// Turn does not typically advance on successful snap.
 	} else {
-		// Failed Snap (ranks don't match)
-		log.Printf("Game %s: Player %s failed snap. Card %s (Rank: %s) does not match discard top %s (Rank: %s). Penalizing.", g.ID, playerID, snappedCard.ID, snappedCard.Rank, lastDiscardedCard.ID, lastDiscardedCard.Rank)
-		g.penalizeSnapFail(playerID, snappedCard) // Pass the card they attempted to snap
+		// --- Failed Snap (Rank Mismatch) ---
+		log.Printf("Game %s: Player %s failed snap (rank mismatch: %s vs %s). Penalizing.", g.ID, playerID, snappedCard.Rank, lastDiscardedCard.Rank)
+		g.penalizeSnapFail(playerID, snappedCard) // Pass the specific card attempted.
 	}
 }
 
-// penalizeSnapFail handles the penalty for an incorrect snap attempt.
+// penalizeSnapFail applies penalties for incorrect snap attempts.
 // Assumes lock is held by caller.
 func (g *CambiaGame) penalizeSnapFail(playerID uuid.UUID, attemptedCard *models.Card) {
-	var attemptedCardID uuid.UUID
+	attemptedCardID := uuid.Nil
 	if attemptedCard != nil {
 		attemptedCardID = attemptedCard.ID
 	}
 	g.logAction(playerID, string(EventPlayerSnapFail), map[string]interface{}{"attemptedCardId": attemptedCardID})
-	player := g.getPlayerByID(playerID)
-	if player == nil {
-		return // Should not happen
-	}
 
-	// Broadcast public failure event
+	player := g.getPlayerByID(playerID) // Assumed to exist.
+
+	// Broadcast public failure event.
 	failEvent := GameEvent{
 		Type: EventPlayerSnapFail,
 		User: &EventUser{ID: playerID},
 	}
-	// Include card details if a card was actually attempted (not just empty discard or race fail)
+	// Include attempted card details if a specific card was involved.
 	if attemptedCard != nil {
-		// Find the index of the failed card for the event payload
-		failIdx := -1
+		failIdx := -1 // Find index for event payload.
 		for i, c := range player.Hand {
 			if c.ID == attemptedCard.ID {
 				failIdx = i
@@ -1277,62 +1195,54 @@ func (g *CambiaGame) penalizeSnapFail(playerID uuid.UUID, attemptedCard *models.
 		}
 		failEvent.Card = &EventCard{
 			ID:    attemptedCard.ID,
-			Rank:  attemptedCard.Rank, // Reveal rank/suit/value on failure as per spec
+			Rank:  attemptedCard.Rank, // Reveal details on failure.
 			Suit:  attemptedCard.Suit,
 			Value: attemptedCard.Value,
 		}
 		if failIdx != -1 {
-			eventIdx := failIdx // Capture for pointer
+			eventIdx := failIdx
 			failEvent.Card.Idx = &eventIdx
 		}
 	}
 	g.fireEvent(failEvent)
 
-	// Apply penalty draws
+	// Apply penalty draws based on house rules.
 	penaltyCount := g.HouseRules.PenaltyDrawCount
 	if penaltyCount <= 0 {
-		log.Printf("Game %s: Penalty draw count is %d. No penalty cards drawn for failed snap by %s.", g.ID, penaltyCount, playerID)
-		return // No penalty if count is zero or less
+		log.Printf("Game %s: No penalty cards drawn for failed snap by %s (Count: %d).", g.ID, playerID, penaltyCount)
+		return
 	}
 	log.Printf("Game %s: Applying %d penalty card(s) to player %s for failed snap.", g.ID, penaltyCount, playerID)
 
-	// REMOVED unused initialHandSize
-	newCardIDs := []uuid.UUID{} // Track IDs for logging
-
+	newCardIDs := []uuid.UUID{} // Track IDs for logging.
 	for i := 0; i < penaltyCount; i++ {
-		card := g.internalDrawStockpile() // Draw internally without broadcasting draw events
+		card := g.internalDrawStockpile() // Draw internally.
 		if card == nil {
-			log.Printf("Game %s: No more cards in stockpile to draw for penalty %d/%d for player %s.", g.ID, i+1, penaltyCount, playerID)
-			break // Stop if deck runs out
+			log.Printf("Game %s: Stockpile empty during penalty draw %d/%d for player %s.", g.ID, i+1, penaltyCount, playerID)
+			break // Stop if deck runs out.
 		}
 
-		// Add card to player's hand
+		// Add card to hand and track ID.
 		player.Hand = append(player.Hand, card)
 		newCardIDs = append(newCardIDs, card.ID)
-		newCardIndex := len(player.Hand) - 1 // The index of the newly added card
+		newCardIndex := len(player.Hand) - 1
 
-		// Broadcast public penalty draw notification (obfuscated card ID)
+		// Broadcast public penalty notification (obfuscated ID).
 		g.fireEvent(GameEvent{
 			Type: EventPlayerSnapPenalty,
-			User: &EventUser{ID: playerID}, // Use standard "User" field
-			Card: &EventCard{ID: card.ID},  // Public only gets ID
+			User: &EventUser{ID: playerID},
+			Card: &EventCard{ID: card.ID},
 			Payload: map[string]interface{}{
 				"count": i + 1,
 				"total": penaltyCount,
 			},
 		})
 
-		// Broadcast private penalty card details
-		privateIdx := newCardIndex // Use the actual index in hand for private message
+		// Broadcast private penalty card details.
+		privateIdx := newCardIndex
 		g.fireEventToPlayer(playerID, GameEvent{
 			Type: EventPrivateSnapPenalty,
-			Card: &EventCard{
-				ID:    card.ID,
-				Idx:   &privateIdx,
-				Rank:  card.Rank, // Reveal full details privately
-				Suit:  card.Suit,
-				Value: card.Value,
-			},
+			Card: &EventCard{ID: card.ID, Idx: &privateIdx, Rank: card.Rank, Suit: card.Suit, Value: card.Value},
 			Payload: map[string]interface{}{
 				"count": i + 1,
 				"total": penaltyCount,
@@ -1342,103 +1252,102 @@ func (g *CambiaGame) penalizeSnapFail(playerID uuid.UUID, attemptedCard *models.
 	g.logAction(playerID, "player_snap_penalty_applied", map[string]interface{}{"count": len(newCardIDs), "newCards": newCardIDs})
 }
 
-// handleCallCambia handles a player calling Cambia.
+// handleCallCambia processes a player calling Cambia, initiating the final round.
 // Assumes lock is held by caller.
 func (g *CambiaGame) handleCallCambia(playerID uuid.UUID) {
+	// Validate state: Cambia not already called.
 	if g.CambiaCalled {
-		log.Printf("Game %s: Player %s attempted to call Cambia, but it was already called by %s. Ignoring.", g.ID, playerID, g.CambiaCallerID)
+		log.Printf("Game %s: Player %s tried to call Cambia, but already called by %s. Ignoring.", g.ID, playerID, g.CambiaCallerID)
 		g.fireEventToPlayer(playerID, GameEvent{Type: EventPrivateSpecialFail, Payload: map[string]interface{}{"message": "Cambia has already been called."}})
 		return
 	}
 
-	// Validate house rules for calling Cambia (e.g., minimum rounds)
-	// Example: Require at least one full round per player before Cambia can be called
-	minTurnsBeforeCambia := len(g.Players) // Simplistic check: turn ID >= num players
-	if g.TurnID < minTurnsBeforeCambia {
-		log.Printf("Game %s: Player %s attempted to call Cambia on turn %d, before minimum turns (%d) requirement met. Ignoring.", g.ID, playerID, g.TurnID, minTurnsBeforeCambia)
-		g.fireEventToPlayer(playerID, GameEvent{Type: EventPrivateSpecialFail, Payload: map[string]interface{}{"message": "Cannot call Cambia yet."}})
-		return
-	}
+	// Optional: Validate house rules for calling Cambia (e.g., minimum rounds).
+	// Example: Require TurnID >= number of players.
+	// if g.TurnID < len(g.Players) { ... return error ... }
 
 	log.Printf("Game %s: Player %s calls Cambia!", g.ID, playerID)
 	g.logAction(playerID, string(EventPlayerCambia), nil)
 
+	// Update game state.
 	g.CambiaCalled = true
 	g.CambiaCallerID = playerID
 
-	// Mark the player model
-	player := g.getPlayerByID(playerID)
+	// Update player state.
+	player := g.getPlayerByID(playerID) // Assumed to exist.
 	if player != nil {
 		player.HasCalledCambia = true
+		player.DrawnCard = nil // Clear any held card.
 	} else {
-		log.Printf("Error: Could not find player %s to mark HasCalledCambia", playerID)
+		log.Printf("Error: Game %s: Could not find player %s to mark HasCalledCambia.", g.ID, playerID)
 	}
 
-	// Broadcast the event
+	// Broadcast the event.
 	g.fireEvent(GameEvent{
 		Type: EventPlayerCambia,
 		User: &EventUser{ID: playerID},
 	})
 
-	// The player's turn ends immediately after calling Cambia.
-	// No draw/discard/replace needed.
-	if player != nil {
-		player.DrawnCard = nil // Ensure no lingering drawn card state
-	}
+	// Turn ends immediately after calling Cambia.
 	g.advanceTurn()
 }
 
-// applySpecialAbilityIfFreshlyDrawn checks if the card has a special ability and triggers the flow.
-// Returns true if a special ability was triggered, false otherwise.
+// applySpecialAbilityIfFreshlyDrawn checks if a discarded card triggers a special action,
+// updates game state accordingly, and either advances the turn or resets the timer.
+// Returns true if an ability was triggered, false otherwise.
 // Assumes lock is held by caller.
 func (g *CambiaGame) applySpecialAbilityIfFreshlyDrawn(c *models.Card, playerID uuid.UUID) bool {
 	specialType := rankToSpecial(c.Rank)
 	if specialType != "" {
+		// --- Special Ability Triggered ---
 		log.Printf("Game %s: Player %s discarded %s (%s), triggering special action choice: %s", g.ID, playerID, c.ID, c.Rank, specialType)
 
-		// Activate special action state
+		// Activate pending special action state.
 		g.SpecialAction = SpecialActionState{
 			Active:        true,
 			PlayerID:      playerID,
 			CardRank:      c.Rank,
-			FirstStepDone: false, // Reset for King
+			FirstStepDone: false, // Reset King state.
 		}
 
-		// Reset turn timer to give player time to decide
-		g.ResetTurnTimer() // Corrected case
+		g.ResetTurnTimer() // Give player time to decide.
 
-		// Broadcast the choice event
+		// Broadcast choice event.
 		g.fireEvent(GameEvent{
 			Type:    EventPlayerSpecialChoice,
 			User:    &EventUser{ID: playerID},
-			Card:    &EventCard{ID: c.ID, Rank: c.Rank}, // Show rank that triggered
+			Card:    &EventCard{ID: c.ID, Rank: c.Rank},
 			Special: specialType,
 		})
 		g.logAction(playerID, string(EventPlayerSpecialChoice), map[string]interface{}{"cardId": c.ID, "rank": c.Rank, "special": specialType})
-		return true // Special ability triggered, turn does NOT advance yet
+
+		return true // Ability triggered, turn does NOT advance yet.
+	} else {
+		// --- No Special Ability ---
+		g.advanceTurn() // Advance turn immediately.
+		return false
 	}
-	// No special ability, advance turn
-	g.advanceTurn()
-	return false
 }
 
-// rankToSpecial maps card ranks to the "special" string identifier used in actions.
+// rankToSpecial maps card ranks to their corresponding special action identifier string.
+// Returns an empty string if the rank has no special ability.
 func rankToSpecial(rank string) string {
 	switch rank {
 	case "7", "8":
 		return "peek_self"
-	case "9", "T": // 9 and 10 (Ten)
+	case "9", "T": // T represents Ten.
 		return "peek_other"
-	case "J", "Q":
+	case "J", "Q": // Jack, Queen.
 		return "swap_blind"
-	case "K":
-		return "swap_peek" // Refers to the initial step for King
+	case "K": // King.
+		return "swap_peek" // Initial step for King.
 	default:
-		return "" // Not a special ability card
+		return ""
 	}
 }
 
-// EndGame finalizes scoring, sets GameOver, logs result, and calls OnGameEnd callback.
+// EndGame finalizes the game, computes scores, determines winners, applies bonuses/penalties,
+// broadcasts results, and triggers the OnGameEnd callback.
 // Assumes lock is held by caller.
 func (g *CambiaGame) EndGame() {
 	if g.GameOver {
@@ -1446,81 +1355,80 @@ func (g *CambiaGame) EndGame() {
 		return
 	}
 	g.GameOver = true
-	g.Started = false // Mark as not started anymore
+	g.Started = false // Mark as inactive.
 	log.Printf("Game %s: Ending game. Computing final scores...", g.ID)
 
-	// Stop timers
+	// Stop timers.
 	if g.turnTimer != nil {
 		g.turnTimer.Stop()
-		g.turnTimer = nil // Clear timer
+		g.turnTimer = nil
 	}
 	if g.preGameTimer != nil {
 		g.preGameTimer.Stop()
-		g.preGameTimer = nil // Clear timer
+		g.preGameTimer = nil
 	}
 
+	// --- Scoring and Winner Determination ---
 	finalScores := g.computeScores()
 	winners, penaltyApplies := g.findWinnersWithCambiaLogic(finalScores)
-
-	// --- Apply Circuit Bonuses/Penalties ---
-	adjustedScores := make(map[uuid.UUID]int)
+	adjustedScores := make(map[uuid.UUID]int) // Scores after bonus/penalty.
 	for id, score := range finalScores {
-		adjustedScores[id] = score // Copy initial scores
+		adjustedScores[id] = score
 	}
 
-	// Apply penalty to caller if they didn't win
+	// Apply Cambia caller penalty if needed.
 	if penaltyApplies && g.CambiaCallerID != uuid.Nil {
 		if _, ok := adjustedScores[g.CambiaCallerID]; ok {
-			penaltyValue := 1 // Default penalty
-			if g.Circuit.Enabled && g.Circuit.Rules.FalseCambiaPenalty > 0 {
+			penaltyValue := 1 // Default penalty.
+			if g.Circuit.Enabled {
 				penaltyValue = g.Circuit.Rules.FalseCambiaPenalty
 			}
 			adjustedScores[g.CambiaCallerID] += penaltyValue
 			log.Printf("Game %s: Applying +%d penalty to Cambia caller %s for not winning.", g.ID, penaltyValue, g.CambiaCallerID)
 		} else {
-			log.Printf("Warning: Cambia caller %s not found in final scores. Cannot apply penalty.", g.CambiaCallerID)
+			log.Printf("Warning: Game %s: Cambia caller %s not found in final scores for penalty.", g.ID, g.CambiaCallerID)
 		}
 	}
 
-	// Apply win bonus if circuit enabled and there are winners
+	// Apply circuit win bonus if needed.
+	winBonusApplied := false
 	if g.Circuit.Enabled && g.Circuit.Rules.WinBonus != 0 && len(winners) > 0 {
-		winBonus := g.Circuit.Rules.WinBonus // Usually negative, e.g., -1
+		winBonus := g.Circuit.Rules.WinBonus
 		for _, winnerID := range winners {
 			if _, ok := adjustedScores[winnerID]; ok {
 				adjustedScores[winnerID] += winBonus
 				log.Printf("Game %s: Applying %d win bonus to winner %s.", g.ID, winBonus, winnerID)
+				winBonusApplied = true
 			}
 		}
 	}
-	// --- End Circuit Bonuses/Penalties ---
+	// --- End Scoring ---
 
-	// Log final state and results using adjusted scores
 	g.logAction(uuid.Nil, string(EventGameEnd), map[string]interface{}{
-		"scores":         adjustedScores, // Log adjusted scores
+		"scores":         adjustedScores,
 		"winners":        winners,
 		"caller":         g.CambiaCallerID,
 		"penaltyApplied": penaltyApplies,
-		"winBonus":       g.Circuit.Rules.WinBonus, // Log potential bonus value
+		"winBonus":       g.Circuit.Rules.WinBonus, // Log potential bonus value.
 	})
-	g.persistFinalGameState(adjustedScores, winners) // Persist final hands etc., using adjusted scores
+	g.persistFinalGameState(adjustedScores, winners) // Persist final hands.
 
-	// Determine the primary winner (first in list, or Nil if no winner)
+	// Determine primary winner for event payload.
 	var firstWinner uuid.UUID
 	if len(winners) > 0 {
 		firstWinner = winners[0]
 	}
 
-	// Broadcast game end event with adjusted results
+	// Broadcast game end event.
 	resultsPayload := map[string]interface{}{
 		"scores":          map[string]int{},
-		"winner":          firstWinner.String(), // Can be Nil UUID string "0000..."
+		"winner":          firstWinner.String(), // "0000..." if no winner.
 		"caller":          g.CambiaCallerID.String(),
 		"penaltyApplied":  penaltyApplies,
-		"winBonusApplied": g.Circuit.Enabled && g.Circuit.Rules.WinBonus != 0 && len(winners) > 0, // Indicate if bonus was applied
-		// Optionally include all winners if needed by client
-		// "winners": winnerIDsToStrings(winners),
+		"winBonusApplied": winBonusApplied,
+		// "winners": winnerIDsToStrings(winners), // Optional: Send all winners.
 	}
-	for pid, score := range adjustedScores { // Use adjusted scores for broadcast
+	for pid, score := range adjustedScores { // Use adjusted scores.
 		resultsPayload["scores"].(map[string]int)[pid.String()] = score
 	}
 	g.fireEvent(GameEvent{
@@ -1528,24 +1436,23 @@ func (g *CambiaGame) EndGame() {
 		Payload: resultsPayload,
 	})
 
-	// Call the OnGameEnd callback if provided (e.g., to update lobby state)
+	// Trigger external callback (e.g., update lobby).
 	if g.OnGameEnd != nil {
-		// Pass the adjusted scores
 		g.OnGameEnd(g.LobbyID, firstWinner, adjustedScores)
 	}
 
-	// Optional: Persist game results and ratings to DB
-	// g.persistResults(adjustedScores, winners) // Uncomment if DB persistence is desired here
+	// Optional: Persist detailed results/ratings.
+	// g.persistResults(adjustedScores, winners)
 
-	log.Printf("Game %s: Ended. Winner(s): %v. Final Scores (after bonuses/penalties): %v", g.ID, winners, adjustedScores)
+	log.Printf("Game %s: Ended. Winner(s): %v. Final Scores (Adj): %v", g.ID, winners, adjustedScores)
 }
 
-// computeScores calculates the sum of card values in each player's hand.
+// computeScores calculates the sum of card values for each valid player.
 // Assumes lock is held by caller.
 func (g *CambiaGame) computeScores() map[uuid.UUID]int {
 	scores := make(map[uuid.UUID]int)
 	for _, p := range g.Players {
-		// Calculate score only if connected or if disconnect doesn't mean forfeit
+		// Score only connected players or if disconnect doesn't forfeit.
 		if p.Connected || !g.HouseRules.ForfeitOnDisconnect {
 			sum := 0
 			for _, c := range p.Hand {
@@ -1553,156 +1460,138 @@ func (g *CambiaGame) computeScores() map[uuid.UUID]int {
 			}
 			scores[p.ID] = sum
 		} else {
-			// Optionally assign a very high score or handle forfeit differently
-			log.Printf("Game %s: Player %s score not computed due to disconnect/forfeit.", g.ID, p.ID)
-			// scores[p.ID] = 999 // Example: Assign high score
+			log.Printf("Game %s: Player %s score omitted (disconnected/forfeited).", g.ID, p.ID)
 		}
 	}
 	return scores
 }
 
 // findWinnersWithCambiaLogic determines winners based on lowest score, applying Cambia rules.
-// Returns: list of winner UUIDs, boolean indicating if caller penalty applies.
+// Returns list of winner UUIDs and bool indicating if caller penalty applies.
 // Assumes lock is held by caller.
 func (g *CambiaGame) findWinnersWithCambiaLogic(scores map[uuid.UUID]int) ([]uuid.UUID, bool) {
 	if len(scores) == 0 {
-		return []uuid.UUID{}, false // No players with scores, no winners
+		return []uuid.UUID{}, false // No scores, no winners.
 	}
 
-	// Find the lowest score among players considered
+	// Find lowest score among scored players.
 	lowestScore := -1
 	first := true
-	consideredPlayerIDs := []uuid.UUID{} // Track IDs considered
-
-	for playerID := range scores { // Iterate over players who have a score
-		consideredPlayerIDs = append(consideredPlayerIDs, playerID)
-		score := scores[playerID]
+	for _, score := range scores {
 		if first || score < lowestScore {
 			lowestScore = score
 			first = false
 		}
 	}
 
-	// If no players were considered (shouldn't happen if scores map is not empty)
-	if len(consideredPlayerIDs) == 0 {
-		return []uuid.UUID{}, false
-	}
-
-	// Find all players with the lowest score
+	// Find all players with the lowest score.
 	potentialWinners := []uuid.UUID{}
-	for _, playerID := range consideredPlayerIDs {
-		if scores[playerID] == lowestScore {
+	for playerID, score := range scores {
+		if score == lowestScore {
 			potentialWinners = append(potentialWinners, playerID)
 		}
 	}
 
-	// Apply Cambia caller logic
-	callerIsPotentialWinner := false
+	// Apply Cambia logic if called.
 	if g.CambiaCalled && g.CambiaCallerID != uuid.Nil {
+		callerIsPotentialWinner := false
 		for _, winnerID := range potentialWinners {
 			if winnerID == g.CambiaCallerID {
 				callerIsPotentialWinner = true
 				break
 			}
 		}
-	}
 
-	if g.CambiaCalled && g.CambiaCallerID != uuid.Nil {
 		if callerIsPotentialWinner {
-			// Caller wins (even if tied)
+			// Caller wins or ties for lowest. They are the sole winner. Penalty does not apply.
 			log.Printf("Game %s: Cambia caller %s won or tied for lowest score (%d).", g.ID, g.CambiaCallerID, lowestScore)
-			return []uuid.UUID{g.CambiaCallerID}, false // No penalty
+			return []uuid.UUID{g.CambiaCallerID}, false
 		} else {
-			// Caller did not win (or tie for lowest).
-			// Penalty applies to the caller.
+			// Caller did not win. Penalty applies. Check for ties among others.
 			log.Printf("Game %s: Cambia caller %s did not win (Lowest score: %d). Penalty applies.", g.ID, g.CambiaCallerID, lowestScore)
-			nonCallerWinners := []uuid.UUID{}
-			for _, winnerID := range potentialWinners {
-				// The list already only contains potential winners (lowest score)
-				nonCallerWinners = append(nonCallerWinners, winnerID)
-			}
-
+			// The winners are the potential winners (who already have the lowest score).
 			// Spec: "If the caller does not win the round, and there exists a tie among remaining players, there is no victory granted."
-			if len(nonCallerWinners) == 1 {
-				// Single non-caller winner
-				log.Printf("Game %s: Single winner (%s) found.", g.ID, nonCallerWinners[0])
-				return nonCallerWinners, true // Single winner, caller penalty applies
+			if len(potentialWinners) == 1 {
+				// Single non-caller winner.
+				log.Printf("Game %s: Single winner (%s) found after caller failed.", g.ID, potentialWinners[0])
+				return potentialWinners, true // Penalty applies to caller.
 			} else {
-				// Tie among non-callers (or no non-caller potential winners), no victory granted
-				log.Printf("Game %s: Tie among %d non-caller winners. No victory granted.", g.ID, len(nonCallerWinners))
-				return []uuid.UUID{}, true // No winner, caller penalty applies
+				// Tie among non-callers, or no non-callers had lowest score. No victory granted.
+				log.Printf("Game %s: Tie among %d non-caller winners. No victory granted.", g.ID, len(potentialWinners))
+				return []uuid.UUID{}, true // No winner, penalty applies to caller.
 			}
 		}
 	} else {
-		// Cambia not called, normal win condition (lowest score wins, ties possible)
+		// Cambia not called: Normal win (lowest score wins, ties allowed).
 		log.Printf("Game %s: Cambia not called. Lowest score: %d. Winners: %v", g.ID, lowestScore, potentialWinners)
-		return potentialWinners, false // No caller penalty
+		return potentialWinners, false // No caller penalty.
 	}
 }
 
-// persistFinalGameState saves the final hands and winners to the database.
+// persistFinalGameState saves final hands and winners to the database.
 // Assumes lock is held by caller.
 func (g *CambiaGame) persistFinalGameState(finalScores map[uuid.UUID]int, winners []uuid.UUID) {
-	type finalHand struct {
-		Rank  string `json:"rank"`
-		Suit  string `json:"suit"`
-		Value int    `json:"value"`
+	type finalHandCard struct {
+		Rank string `json:"rank"`
+		Suit string `json:"suit"`
+		Val  int    `json:"value"` // Use 'Val' to avoid conflict if struct embedding happens later
 	}
 	type finalPlayerState struct {
-		Hand  []finalHand `json:"hand"`
-		Score int         `json:"score"`
+		Hand  []finalHandCard `json:"hand"`
+		Score int             `json:"score"`
 	}
+	// Snapshot structure matches expected JSONB format.
 	snapshot := map[string]interface{}{
 		"players": map[string]finalPlayerState{},
-		"winners": winners, // Store winner IDs
+		"winners": winners, // Store list of winner UUIDs.
 	}
 
 	playerStates := snapshot["players"].(map[string]finalPlayerState)
-	for _, p := range g.Players { // Iterate over original player list
+	for _, p := range g.Players { // Iterate over original player list to capture all hands.
 		score, scoreOk := finalScores[p.ID]
 		if !scoreOk {
-			// Handle players who might not have a score (e.g., disconnected/forfeited)
-			// Depending on rules, they might still have a hand state to record
-			// score = 999 // Assign high score if not found? Or omit? Omit for now.
+			// Handle players without a score (e.g., forfeited).
+			// Record their hand but maybe use a special score indicator?
+			score = -999 // Example: Indicate forfeit score.
 		}
 		state := finalPlayerState{
-			Hand:  make([]finalHand, len(p.Hand)),
-			Score: score, // Store the calculated score
+			Hand:  make([]finalHandCard, len(p.Hand)),
+			Score: score,
 		}
 		for i, c := range p.Hand {
-			state.Hand[i] = finalHand{Rank: c.Rank, Suit: c.Suit, Value: c.Value}
+			state.Hand[i] = finalHandCard{Rank: c.Rank, Suit: c.Suit, Val: c.Value}
 		}
 		playerStates[p.ID.String()] = state
 	}
 
+	// Persist asynchronously.
 	go database.StoreFinalGameStateInDB(context.Background(), g.ID, snapshot)
 }
 
-// removeCardFromPlayerHand removes a card from a player's hand by ID.
+// removeCardFromPlayerHand removes a specific card instance from a player's hand.
+// Returns true if found and removed, false otherwise, and the index where it was found.
 // Assumes lock is held by caller.
-func (g *CambiaGame) removeCardFromPlayerHand(playerID, cardID uuid.UUID) (bool, int) { // Return bool success, int index
+func (g *CambiaGame) removeCardFromPlayerHand(playerID, cardID uuid.UUID) (bool, int) {
 	player := g.getPlayerByID(playerID)
 	if player == nil {
 		return false, -1
 	}
-	newHand := []*models.Card{}
-	found := false
 	removedIndex := -1
 	for i, c := range player.Hand {
-		if c.ID != cardID {
-			newHand = append(newHand, c)
-		} else {
-			found = true
+		if c.ID == cardID {
 			removedIndex = i
+			break
 		}
 	}
-	if found {
-		player.Hand = newHand
+	if removedIndex != -1 {
+		player.Hand = append(player.Hand[:removedIndex], player.Hand[removedIndex+1:]...)
+		return true, removedIndex
 	}
-	return found, removedIndex
+	return false, -1
 }
 
-// getPlayerByID is a helper to find a player struct by their ID.
+// getPlayerByID finds a player struct by ID within the game's Players slice.
+// Returns the player pointer or nil if not found.
 // Assumes lock is held by caller.
 func (g *CambiaGame) getPlayerByID(playerID uuid.UUID) *models.Player {
 	for _, p := range g.Players {
@@ -1713,97 +1602,103 @@ func (g *CambiaGame) getPlayerByID(playerID uuid.UUID) *models.Player {
 	return nil
 }
 
-// logAction sends the action details to the historian service via Redis.
+// logAction sends game action details to the historian service via Redis queue.
+// Increments the internal action index for ordering.
 // Assumes lock is held by caller.
 func (g *CambiaGame) logAction(actorID uuid.UUID, actionType string, payload map[string]interface{}) {
-	g.actionIndex++ // Increment action index for ordering
-	// Ensure payload is not nil for marshaling
+	g.actionIndex++
 	if payload == nil {
-		payload = make(map[string]interface{})
+		payload = make(map[string]interface{}) // Ensure payload is not nil.
 	}
 	record := cache.GameActionRecord{
 		GameID:        g.ID,
 		ActionIndex:   g.actionIndex,
-		ActorUserID:   actorID,
+		ActorUserID:   actorID, // Can be Nil for game events.
 		ActionType:    actionType,
 		ActionPayload: payload,
 		Timestamp:     time.Now().UnixMilli(),
 	}
-	// Asynchronously publish to Redis
+
+	// Asynchronously publish to Redis.
 	go func(rec cache.GameActionRecord) {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second) // Short timeout for Redis push
+		// Short timeout for the Redis operation.
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
+		// Check if Redis client is initialized.
 		if cache.Rdb == nil {
-			// This can happen if Redis isn't connected yet at startup
-			// log.Printf("Warning: Redis client (Rdb) is nil. Cannot log action %d for game %s.", rec.ActionIndex, g.ID)
+			// log.Printf("Debug: Redis client (Rdb) is nil. Cannot log action %d for game %s.", rec.ActionIndex, g.ID) // Reduce noise
 			return
 		}
 		if err := cache.PublishGameAction(ctx, rec); err != nil {
-			log.Printf("Error publishing game action %d to Redis for game %s: %v", rec.ActionIndex, g.ID, err)
+			log.Printf("Error: Game %s: Failed publishing action %d ('%s') to Redis: %v", g.ID, rec.ActionIndex, rec.ActionType, err)
 		}
 	}(record)
 }
 
-// ResetTurnTimer is exported for external usage (e.g., special actions).
+// ResetTurnTimer restarts the turn timer for the current player.
+// Exported for use by special action logic.
 // Assumes lock is held by caller.
 func (g *CambiaGame) ResetTurnTimer() {
-	g.scheduleNextTurnTimer() // Use the internal scheduler
+	g.scheduleNextTurnTimer() // Use the internal scheduler.
 }
 
-// FireEventPrivateSpecialActionFail sends a private fail event. Lock should be held by caller.
+// FireEventPrivateSpecialActionFail helper to send a private failure event for special actions.
+// Assumes lock is held by caller.
 func (g *CambiaGame) FireEventPrivateSpecialActionFail(userID uuid.UUID, reason string, special string, card1, card2 *EventCard) {
 	ev := GameEvent{
 		Type:    EventPrivateSpecialFail,
 		Special: special,
 		Payload: map[string]interface{}{"message": reason},
-		Card1:   card1, // Include card info in failure message as per spec
+		Card1:   card1, // Include card info if relevant to the failure.
 		Card2:   card2,
 	}
 	g.fireEventToPlayer(userID, ev)
 	g.logAction(userID, string(EventPrivateSpecialFail), map[string]interface{}{"reason": reason, "special": special})
 }
 
-// FailSpecialAction handles failing a special action. Lock should be held by caller.
+// FailSpecialAction clears the pending special action state and advances the turn, sending a failure event.
+// Assumes lock is held by caller.
 func (g *CambiaGame) FailSpecialAction(userID uuid.UUID, reason string) {
 	if !g.SpecialAction.Active || g.SpecialAction.PlayerID != userID {
-		log.Printf("Warning: FailSpecialAction called for player %s but no action active or mismatch.", userID)
-		// Send fail event even if state seems inconsistent, as player might expect a response
+		log.Printf("Warning: Game %s: FailSpecialAction called for %s but state mismatch (Active:%v, Player:%s). Sending fail event anyway.", g.ID, userID, g.SpecialAction.Active, g.SpecialAction.PlayerID)
+		// Send fail event even if state is inconsistent.
 		g.FireEventPrivateSpecialActionFail(userID, reason, g.SpecialAction.CardRank, nil, nil)
+		// Don't advance turn if state was already inconsistent.
 		return
 	}
-	specialType := rankToSpecial(g.SpecialAction.CardRank) // Get type before clearing
+	specialType := rankToSpecial(g.SpecialAction.CardRank) // Get type before clearing.
 	log.Printf("Game %s: Failing special action %s for player %s. Reason: %s", g.ID, specialType, userID, reason)
 
-	// Fire the fail event *before* clearing state
-	// Pass nil for cards as this is a generic failure not tied to specific selections usually
+	// Fire the fail event before clearing state.
 	g.FireEventPrivateSpecialActionFail(userID, reason, specialType, nil, nil)
 
-	g.SpecialAction = SpecialActionState{} // Clear state
-	g.advanceTurn()                        // Advance turn after failure
+	g.SpecialAction = SpecialActionState{} // Clear state.
+	g.advanceTurn()                        // Advance turn after failure.
 }
 
-// FireEventPrivateSuccess sends a private success event revealing card details. Lock should be held by caller.
+// FireEventPrivateSuccess helper to send a private success event for special actions.
+// Assumes lock is held by caller.
 func (g *CambiaGame) FireEventPrivateSuccess(userID uuid.UUID, special string, c1Ev, c2Ev *EventCard) {
 	ev := GameEvent{
-		Type:    EventPrivateSpecialSuccess, // Correct event type
+		Type:    EventPrivateSpecialSuccess,
 		Special: special,
-		Card1:   c1Ev,
+		Card1:   c1Ev, // Include revealed card details.
 		Card2:   c2Ev,
 	}
 	g.fireEventToPlayer(userID, ev)
-	// Logging handled within specific do* functions
+	// Logging is typically handled within the specific do* action function.
 }
 
-// FireEventPlayerSpecialAction broadcasts public info about a special action. Lock should be held by caller.
-// Requires card details (ID, maybe index/user) for the event payload.
+// FireEventPlayerSpecialAction helper to broadcast public info about a special action.
+// Assumes lock is held by caller.
 func (g *CambiaGame) FireEventPlayerSpecialAction(userID uuid.UUID, special string, c1Ev, c2Ev *EventCard) {
 	ev := GameEvent{
 		Type:    EventPlayerSpecialAction,
 		User:    &EventUser{ID: userID},
 		Special: special,
-		Card1:   c1Ev, // Pass the prepared EventCard structs
+		Card1:   c1Ev, // Include obfuscated card details (ID, index, owner).
 		Card2:   c2Ev,
 	}
 	g.fireEvent(ev)
-	// Logging handled within specific do* functions
+	// Logging is typically handled within the specific do* action function.
 }
