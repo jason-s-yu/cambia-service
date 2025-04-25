@@ -130,8 +130,6 @@ func NewLobbyWithDefaults(hostID uuid.UUID) *Lobby {
 // InviteUser ephemeral sets userID => false in the Users map (private-lobby invitation).
 // Calls the unsafe version assuming caller holds the lock.
 func (lobby *Lobby) InviteUser(userID uuid.UUID) {
-	// REMOVED: lobby.Mu.Lock()
-	// REMOVED: defer lobby.Mu.Unlock()
 	lobby.inviteUserUnsafe(userID) // Call unsafe version
 }
 
@@ -319,8 +317,6 @@ func (lobby *Lobby) StartCountdownUnsafe(seconds int, callback func(*Lobby)) boo
 
 // StartCountdown starts a countdown. Calls the unsafe version assuming caller holds the lock.
 func (lobby *Lobby) StartCountdown(seconds int, callback func(*Lobby)) bool {
-	// REMOVED: lobby.Mu.Lock()
-	// REMOVED: defer lobby.Mu.Unlock()
 	return lobby.StartCountdownUnsafe(seconds, callback)
 }
 
@@ -344,8 +340,6 @@ func (lobby *Lobby) CancelCountdownUnsafe() {
 
 // CancelCountdown stops any existing countdown. Calls the unsafe version assuming caller holds the lock.
 func (lobby *Lobby) CancelCountdown() {
-	// REMOVED: lobby.Mu.Lock()
-	// REMOVED: defer lobby.Mu.Unlock()
 	lobby.CancelCountdownUnsafe()
 }
 
@@ -382,9 +376,7 @@ func (lobby *Lobby) MarkUserReadyUnsafe(userID uuid.UUID) bool {
 
 // MarkUserReady sets ready state. Calls the unsafe version assuming caller holds the lock.
 func (lobby *Lobby) MarkUserReady(userID uuid.UUID) bool { // Return bool to match unsafe version
-	// REMOVED: lobby.Mu.Lock()
 	shouldStart := lobby.MarkUserReadyUnsafe(userID)
-	// REMOVED: lobby.Mu.Unlock()
 
 	// Note: The countdown starting logic needs to happen outside this function,
 	// typically in the caller (handleLobbyMessage) after the lock is released.
@@ -423,9 +415,7 @@ func (lobby *Lobby) MarkUserUnreadyUnsafe(userID uuid.UUID) {
 
 // MarkUserUnready sets unready state. Calls the unsafe version assuming caller holds the lock.
 func (lobby *Lobby) MarkUserUnready(userID uuid.UUID) {
-	// REMOVED: lobby.Mu.Lock()
 	lobby.MarkUserUnreadyUnsafe(userID)
-	// REMOVED: lobby.Mu.Unlock()
 }
 
 // AreAllReadyUnsafe checks readiness without acquiring lock. Assumes lock is held.
@@ -468,9 +458,7 @@ func (lobby *Lobby) BroadcastAllUnsafe(msg map[string]interface{}) {
 
 // BroadcastAll sends msg to every connected user. Calls the unsafe version assuming caller holds the lock.
 func (lobby *Lobby) BroadcastAll(msg map[string]interface{}) {
-	// REMOVED: lobby.Mu.Lock()
 	lobby.BroadcastAllUnsafe(msg) // Call the unsafe version
-	// REMOVED: lobby.Mu.Unlock()
 }
 
 // GetLobbyStatusPayloadUnsafe gathers current user status. Assumes lock is held.
@@ -512,15 +500,12 @@ func (lobby *Lobby) getLobbyJoinPayloadUnsafe(userID uuid.UUID) map[string]inter
 
 // BroadcastJoin notifies that a user joined. Calls the unsafe version assuming caller holds the lock.
 func (lobby *Lobby) BroadcastJoin(userID uuid.UUID) {
-	// REMOVED: lobby.Mu.Lock()
 	payload := lobby.getLobbyJoinPayloadUnsafe(userID)
-	// REMOVED: lobby.Mu.Unlock()
 	lobby.BroadcastAll(payload) // BroadcastAll now calls Unsafe internally
 }
 
 // BroadcastReadyState notifies that user changed readiness. Calls the unsafe version assuming caller holds the lock.
 func (lobby *Lobby) BroadcastReadyState(userID uuid.UUID, ready bool) {
-	// REMOVED: lobby.Mu.Lock()
 	username := "Unknown"
 	if conn, ok := lobby.Connections[userID]; ok {
 		username = conn.Username
@@ -531,7 +516,6 @@ func (lobby *Lobby) BroadcastReadyState(userID uuid.UUID, ready bool) {
 		"username": username, // Include username
 		"is_ready": ready,
 	}
-	// REMOVED: lobby.Mu.Unlock()
 	lobby.BroadcastAll(payload) // BroadcastAll now calls Unsafe internally
 }
 
@@ -541,7 +525,7 @@ func (lobby *Lobby) getLobbyLeavePayloadUnsafe(userID uuid.UUID) map[string]inte
 	// Check Connections map for username *before* it's removed
 	if conn, ok := lobby.Connections[userID]; ok {
 		username = conn.Username
-	} // Removed DB fallback for simplicity and to avoid potential blocks
+	}
 
 	// Get status *after* user is conceptually removed (caller manages removal timing)
 	// Note: getLobbyStatusPayloadUnsafe reads the *current* state
@@ -555,9 +539,7 @@ func (lobby *Lobby) getLobbyLeavePayloadUnsafe(userID uuid.UUID) map[string]inte
 
 // BroadcastLeave notifies that a user left. Calls the unsafe version assuming caller holds the lock.
 func (lobby *Lobby) BroadcastLeave(userID uuid.UUID) {
-	// REMOVED: lobby.Mu.Lock()
 	payload := lobby.getLobbyLeavePayloadUnsafe(userID)
-	// REMOVED: lobby.Mu.Unlock()
 	lobby.BroadcastAll(payload) // BroadcastAll now calls Unsafe internally
 }
 
@@ -583,15 +565,12 @@ func (lobby *Lobby) BroadcastChatUnsafe(senderConn *LobbyConnection, msg string)
 // BroadcastChat broadcasts a chat message from userID (public method, acquires lock).
 // Now calls the unsafe version assuming caller (e.g., handleLobbyMessage) holds the lock.
 func (lobby *Lobby) BroadcastChat(userID uuid.UUID, msg string) {
-	// REMOVED: lobby.Mu.Lock()
 	conn, ok := lobby.Connections[userID]
 	if !ok {
 		log.Printf("Lobby %s: Cannot broadcast chat for disconnected user %s", lobby.ID, userID)
-		// REMOVED: lobby.Mu.Unlock()
 		return
 	}
 	lobby.BroadcastChatUnsafe(conn, msg)
-	// REMOVED: lobby.Mu.Unlock()
 }
 
 // getLobbyStatePayloadUnsafe prepares the full state message. Assumes lock is held.
@@ -673,7 +652,7 @@ func (lobby *Lobby) BroadcastRulesUpdateUnsafe() {
 		"type":  "lobby_rules_updated",
 		"rules": rulesPayload, // Nest house_rules, circuit, settings under "rules"
 	}
-	// log.Printf("[Lobby %s BroadcastRulesUpdateUnsafe] Broadcasting payload: %+v", lobby.ID, payload) // Reduce noise
+	log.Printf("[Lobby %s BroadcastRulesUpdateUnsafe] Broadcasting payload: %+v", lobby.ID, payload)
 	lobby.BroadcastAllUnsafe(payload) // Use unsafe as lock is held
 }
 
@@ -682,7 +661,7 @@ func (lobby *Lobby) BroadcastRulesUpdateUnsafe() {
 // (Content of this function remains the same as it was already correct)
 func (lobby *Lobby) UpdateUnsafe(rules map[string]interface{}) error {
 	changed := false // Track if any changes were actually made
-	// log.Printf("Lobby %s: UpdateUnsafe called with payload: %+v", lobby.ID, rules) // Reduce noise
+	log.Printf("Lobby %s: UpdateUnsafe called with payload: %+v", lobby.ID, rules)
 
 	// Use a temporary copy of HouseRules to perform updates and check for changes
 	tempHR := lobby.HouseRules
@@ -693,7 +672,6 @@ func (lobby *Lobby) UpdateUnsafe(rules map[string]interface{}) error {
 		}
 		if tempHR != lobby.HouseRules { // Compare updated temp with original
 			lobby.HouseRules = tempHR // Apply change if different
-			// log.Printf("Lobby %s: HouseRules changed (unsafe).", lobby.ID) // Reduce noise
 			changed = true
 		}
 	}
@@ -736,7 +714,6 @@ func (lobby *Lobby) UpdateUnsafe(rules map[string]interface{}) error {
 		}
 		if madeCircuitChange {
 			lobby.Circuit = tempCircuit // Apply change if different
-			// log.Printf("Lobby %s: Circuit settings changed (unsafe).", lobby.ID) // Reduce noise
 			changed = true
 		}
 	}
@@ -761,20 +738,17 @@ func (lobby *Lobby) UpdateUnsafe(rules map[string]interface{}) error {
 
 	// Broadcast if changes were made
 	if changed {
-		// log.Printf("Lobby %s: Rules update detected changes (unsafe). Broadcasting...", lobby.ID) // Reduce noise
-		lobby.BroadcastRulesUpdateUnsafe() // Call unsafe broadcast version
+		log.Printf("Lobby %s: Rules update detected changes (unsafe). Broadcasting...", lobby.ID) // Reduce noise
+		lobby.BroadcastRulesUpdateUnsafe()                                                        // Call unsafe broadcast version
 	} else {
-		// log.Printf("Lobby %s: No rules changes detected after update attempt (unsafe).", lobby.ID) // Reduce noise
+		log.Printf("Lobby %s: No rules changes detected after update attempt (unsafe).", lobby.ID) // Reduce noise
 	}
 	return nil // Return nil on success
 }
 
 // Update applies changes. Calls the unsafe version assuming caller holds the lock.
-func (lobby *Lobby) Update(rules map[string]interface{}) error { // Return error
-	// REMOVED: lobby.Mu.Lock()
-	// REMOVED: defer lobby.Mu.Unlock()
-	return lobby.UpdateUnsafe(rules) // Return error from unsafe version
-	// No need to log error here, caller should handle it
+func (lobby *Lobby) Update(rules map[string]interface{}) error {
+	return lobby.UpdateUnsafe(rules)
 }
 
 func (l *Lobby) GetConnectionsUnsafe() []*LobbyConnection {
